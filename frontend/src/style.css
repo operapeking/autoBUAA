@@ -1,0 +1,33 @@
+@import "tailwindcss";
+@theme inline {
+  --color-background: var(--background); --color-foreground: var(--foreground);
+  --color-card: var(--card); --color-card-foreground: var(--foreground);
+  --color-primary: var(--primary); --color-primary-foreground: #fff;
+  --color-secondary: #edf0ed; --color-secondary-foreground: #172b24;
+  --color-muted: #f4f5f4; --color-muted-foreground: #707772;
+  --color-accent: #f0f3f0; --color-accent-foreground: #172b24;
+  --color-border: #e3e7e3; --color-input: #dfe5e0; --color-ring: #588272;
+  --color-destructive: #b83b3b;
+  --radius-sm: .375rem; --radius-md: .5rem; --radius-lg: .75rem; --radius-xl: 1rem;
+}
+:root { --background: #fafbf9; --foreground: #202823; --card: #fff; --primary: #285341; --text-muted: #707772; font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; color: var(--foreground); background: var(--background); font-synthesis: none; }
+@layer base { * { @apply border-border; } body { margin: 0; } button, input, select { font: inherit; } button { cursor: pointer; } button:disabled { cursor: default; } h1 { @apply text-3xl font-semibold tracking-tight; } }
+@layer components {
+  .app-shell { @apply min-h-screen md:grid md:grid-cols-[224px_1fr]; }
+  .sidebar { @apply bg-white border-b md:border-b-0 md:border-r md:fixed md:inset-y-0 md:w-56 flex md:flex-col p-5 gap-5 items-center md:items-stretch; }
+  .brand { @apply flex items-center gap-3 md:py-5; }
+  .brand-mark { @apply size-9 shrink-0 rounded-lg bg-primary text-white grid place-items-center text-lg font-semibold; }
+  .nav-list { @apply flex md:flex-col gap-2 flex-1; }
+  .sidebar-footer { @apply md:mt-auto flex items-center justify-between md:border-t md:pt-4; }
+  .sidebar-footer > span { @apply hidden md:block; }
+  .main-area { @apply p-5 sm:p-8 lg:px-12 lg:py-10 md:col-start-2 mx-auto w-full max-w-7xl; }
+  .eyebrow { @apply text-[10px] tracking-[0.22em] text-muted-foreground mb-3 font-semibold; }
+  .field { @apply flex flex-col gap-2 text-sm; }
+  .field select, .compact-input { @apply h-9 rounded-md border bg-white px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50; }
+  .data-row { @apply flex justify-between items-center border-b last:border-b-0 py-4; }
+  .empty-state { @apply py-12 text-sm text-center text-muted-foreground; }
+  .error-box { @apply rounded-md border border-destructive/20 bg-destructive/5 p-3 text-sm text-destructive; }
+  .success-box { @apply rounded-md border border-primary/20 bg-primary/5 p-3 text-sm text-primary; }
+  .auth-page { @apply min-h-screen flex items-center justify-center p-5; }
+}
+@media (max-width: 640px) { .sidebar { flex-wrap: wrap; gap: 12px; } .nav-list { order: 3; width: 100%; flex-basis: 100%; } .brand { flex: 1; } }

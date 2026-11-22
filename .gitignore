@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.sqlite
+*.sqlite3
+data/
+dist/
+node_modules/
+frontend/dist/
+.env
+.pytest_cache/
+*.egg-info/
+.ruff_cache/
