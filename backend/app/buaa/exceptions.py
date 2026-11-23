@@ -8,13 +8,6 @@ class BuaaError(Exception):
     """Base error for BUAA upstream adapters."""
 
 
-class NetworkDiagnosticsError(BuaaError):
-    def __init__(self, step: str, message: str) -> None:
-        super().__init__(message)
-        self.step = step
-        self.message = message
-
-
 class SessionExpiredError(BuaaError):
     pass
 
@@ -31,10 +24,7 @@ class BusinessTerminalError(BuaaError):
 class CaptchaChallenge:
     captcha_id: str
     captcha_type: str
-    execution: str
-    image_path: Path | None = None
-    image_bytes: bytes = b""
-    mime_type: str = "image/jpeg"
+    image_path: Path
 
 
 class CaptchaRequiredError(BuaaError):
@@ -47,3 +37,13 @@ class CaptchaRequiredError(BuaaError):
 
 class LoginFailedError(BuaaError):
     pass
+
+
+def parse_int(value: object) -> int | None:
+    """Lenient integer parsing for upstream JSON fields (bools and blanks are None)."""
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None

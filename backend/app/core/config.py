@@ -18,9 +18,7 @@ class Settings(BaseSettings):
     )
 
     data_dir: Path = Path("./data")
-    port: int = 8080
     log_level: str = "DEBUG"
-    timezone: str = "Asia/Shanghai"
     secret_key_file: Path | None = None
     cookie_secure: bool = False
     scheduler_poll_seconds: float = Field(default=1.0, ge=0.2, le=60)

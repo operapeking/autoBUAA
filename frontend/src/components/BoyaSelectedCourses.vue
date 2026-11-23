@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue';
 import { useIntervalFn } from '@vueuse/core';
-import { formatTime, type BoyaCourse } from '@/api/client';
+import type { BoyaCourse } from '@/api/client';
+import { formatTime } from '@/lib/format';
 import { attendanceStatus, assessmentStatus } from '@/lib/boya';
 import BoyaCourseDetails from './BoyaCourseDetails.vue';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';

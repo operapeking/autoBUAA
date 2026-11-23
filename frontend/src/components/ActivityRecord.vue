@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Badge } from '@/components/ui/badge';
-import { formatRecordTime, moduleNames, statusNames } from '@/api/client';
+import { formatRecordTime, moduleNames, statusNames } from '@/lib/format';
 
 defineProps<{
   title: string;

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { api, formatTime, moduleNames, type ModuleConfigItem, type ClassroomCourse, type BoyaData, type YgdkData, type TdData } from '@/api/client';
+import { api, type ModuleConfigItem, type ClassroomCourse, type BoyaData, type YgdkData, type TdData } from '@/api/client';
+import { formatTime, moduleNames } from '@/lib/format';
 import { useLive } from '@/composables/useLive';
 import { sortBoyaCourses } from '@/lib/boya';
 import BoyaSelectedCourses from '@/components/BoyaSelectedCourses.vue';
@@ -21,14 +22,17 @@ const selectedCourses = computed(() => sortBoyaCourses(boya.value.courses.filter
 const availableCourses = computed(() => sortBoyaCourses(boya.value.courses.filter(course => !course.selected)));
 const { error, loading, refresh } = useLive(async () => {
   if (busy.value) return;
-  const [net, cls, by, yg, td] = await Promise.all([api.network.get(), api.classroom.courses(), api.boya.courses(), api.ygdk.overview(), api.td.overview()]);
-  modules.value = net.modules; classroom.value = cls.courses; boya.value = by; sunshine.value = yg; fitness.value = td;
+  const [mods, cls, by, yg, td] = await Promise.all([api.modules.list(), api.classroom.courses(), api.boya.courses(), api.ygdk.overview(), api.td.overview()]);
+  modules.value = mods; classroom.value = cls.courses; boya.value = by; sunshine.value = yg; fitness.value = td;
 });
 async function act(fn: () => Promise<unknown>) {
   if (busy.value) return;
   busy.value = true; actionError.value = '';
   try { await fn(); } catch (err) { actionError.value = err instanceof Error ? err.message : '操作失败'; }
   finally { busy.value = false; await refresh(); }
+}
+function saveModule(mod: ModuleConfigItem, changes: { enabled?: boolean; config?: Record<string, unknown> }) {
+  return act(() => api.modules.update(mod.module, { enabled: changes.enabled ?? mod.enabled, config_json: { ...mod.config_json, ...changes.config } }));
 }
 function progress(count: number | null | undefined, target: number | null | undefined) { return `${count ?? '—'} / ${target ?? '—'}`; }
 </script>
@@ -39,15 +43,15 @@ function progress(count: number | null | undefined, target: number | null | unde
     <p v-if="loading" class="text-muted-foreground">正在获取校园事务…</p>
     <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
       <Card v-for="mod in modules" :key="mod.module">
-        <CardHeader><div class="flex justify-between items-center"><CardTitle>{{ moduleNames[mod.module] }}</CardTitle><Switch :aria-label="`启用${moduleNames[mod.module]}`" :model-value="mod.enabled" :disabled="busy" @update:model-value="value => act(() => api.network.updateModule(mod.module, { enabled: value, config_json: mod.config_json }))" /></div></CardHeader>
+        <CardHeader><div class="flex justify-between items-center"><CardTitle>{{ moduleNames[mod.module] }}</CardTitle><Switch :aria-label="`启用${moduleNames[mod.module]}`" :model-value="mod.enabled" :disabled="busy" @update:model-value="value => saveModule(mod, { enabled: value })" /></div></CardHeader>
         <CardContent class="space-y-4">
-          <div v-if="mod.module === 'classroom' || mod.module === 'boya'" class="flex items-center justify-between text-sm"><span>自动签到{{ mod.module === 'boya' ? '与签退' : '' }}</span><Switch :aria-label="`${moduleNames[mod.module]}自动签到`" :model-value="mod.config_json.auto_sign !== false" :disabled="busy || !mod.enabled" @update:model-value="value => act(() => api.network.updateModule(mod.module, { enabled: mod.enabled, config_json: { ...mod.config_json, auto_sign: value } }))" /></div>
-          <div v-else-if="mod.module === 'ygdk'" class="flex items-center justify-between text-sm"><label for="reminder-time">每日提醒时间</label><input id="reminder-time" class="compact-input" type="time" :value="mod.config_json.reminder_time" :disabled="busy" @change="event => act(() => api.network.updateModule(mod.module, { enabled: mod.enabled, config_json: { reminder_time: (event.target as HTMLInputElement).value } }))" /></div>
+          <div v-if="mod.module === 'classroom' || mod.module === 'boya'" class="flex items-center justify-between text-sm"><span>自动签到{{ mod.module === 'boya' ? '与签退' : '' }}</span><Switch :aria-label="`${moduleNames[mod.module]}自动签到`" :model-value="mod.config_json.auto_sign !== false" :disabled="busy || !mod.enabled" @update:model-value="value => saveModule(mod, { config: { auto_sign: value } })" /></div>
+          <div v-else-if="mod.module === 'ygdk'" class="flex items-center justify-between text-sm"><label for="reminder-time">每日提醒时间</label><input id="reminder-time" class="compact-input" type="time" :value="mod.config_json.reminder_time" :disabled="busy" @change="event => saveModule(mod, { config: { reminder_time: (event.target as HTMLInputElement).value } })" /></div>
           <template v-else-if="mod.module === 'td'">
-            <div class="flex items-center justify-between text-sm"><label for="td-term-target">学期目标次数</label><input id="td-term-target" class="compact-input w-20" type="number" min="1" max="10000" step="1" :value="mod.config_json.term_target" :disabled="busy" @change="event => act(() => api.network.updateModule(mod.module, { enabled: mod.enabled, config_json: { term_target: Number((event.target as HTMLInputElement).value) } }))" /></div>
+            <div class="flex items-center justify-between text-sm"><label for="td-term-target">学期目标次数</label><input id="td-term-target" class="compact-input w-20" type="number" min="1" max="10000" step="1" :value="mod.config_json.term_target" :disabled="busy" @change="event => saveModule(mod, { config: { term_target: Number((event.target as HTMLInputElement).value) } })" /></div>
             <p class="text-sm text-muted-foreground">启用后每小时更新状态</p>
           </template>
-          <div v-if="mod.module === 'boya'" class="flex items-center justify-between text-sm"><span>按照账号校区过滤</span><Switch aria-label="博雅课程按照校区过滤" :model-value="mod.config_json.filter_by_campus !== false" :disabled="busy" @update:model-value="value => act(() => api.network.updateModule(mod.module, { enabled: mod.enabled, config_json: { ...mod.config_json, filter_by_campus: value } }))" /></div>
+          <div v-if="mod.module === 'boya'" class="flex items-center justify-between text-sm"><span>按照账号校区过滤</span><Switch aria-label="博雅课程按照校区过滤" :model-value="mod.config_json.filter_by_campus !== false" :disabled="busy" @update:model-value="value => saveModule(mod, { config: { filter_by_campus: value } })" /></div>
           <p v-if="mod.last_error" class="text-sm text-destructive">{{ mod.last_error }}</p>
           <p class="text-xs text-muted-foreground">{{ mod.enabled ? '已启用' : '已停用' }} · 更新于 {{ formatTime(mod.last_checked_at) }}</p>
         </CardContent>

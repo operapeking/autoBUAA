@@ -5,11 +5,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable, Literal
 
 from app.core.time import Clock, default_clock
-from app.db.models import (
-    TaskDefinition,
-    TaskSchedule,
-    TaskStage,
-)
+from app.db.models import TaskExecution, TaskSchedule, TaskStage
 from app.framework.triggers import compute_next_run, validate_trigger
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
@@ -68,7 +64,6 @@ class TaskContext:
     retry_count: int
     clock: Clock
     db_session_factory: Any
-    cipher: Any
 
     def get_stage_payload(self, stage_name: str | None = None) -> dict[str, Any]:
         target = stage_name or self.stage
@@ -80,33 +75,51 @@ class TaskContext:
             )
             return dict(row.payload_json) if row else {}
 
-    def save_stage(
-        self,
-        stage_name: str,
-        status: str,
-        payload: dict[str, Any],
-        resume_at: datetime | None = None,
-    ) -> None:
+    def save_stage(self, stage_name: str, status: str, payload: dict[str, Any]) -> None:
         with self.db_session_factory() as session:
-            row = (
-                session.query(TaskStage)
-                .filter_by(execution_id=self.execution_id, stage_name=stage_name)
-                .first()
-            )
-            if row is None:
-                row = TaskStage(
-                    execution_id=self.execution_id,
-                    stage_name=stage_name,
-                    status=status,
-                    payload_json=payload,
-                    resume_at=resume_at,
-                )
-                session.add(row)
-            else:
-                row.status = status
-                row.payload_json = payload
-                row.resume_at = resume_at
+            upsert_stage(session, self.execution_id, stage_name, status, payload)
             session.commit()
+
+
+def upsert_stage(
+    session: Session,
+    execution_id: int,
+    stage_name: str,
+    status: str,
+    payload: dict[str, Any],
+    resume_at: datetime | None = None,
+) -> None:
+    row = (
+        session.query(TaskStage)
+        .filter_by(execution_id=execution_id, stage_name=stage_name)
+        .first()
+    )
+    if row is None:
+        row = TaskStage(execution_id=execution_id, stage_name=stage_name)
+        session.add(row)
+    row.status = status
+    row.payload_json = payload
+    row.resume_at = resume_at
+
+
+def cancel_active_executions(
+    session: Session, now_utc: datetime, *criteria: Any
+) -> None:
+    """Cancel queued or waiting executions matching the given filter criteria."""
+    for execution in session.query(TaskExecution).filter(
+        TaskExecution.status.in_(["pending", "waiting", "pending_confirm"]), *criteria
+    ):
+        execution.status = "cancelled"
+        execution.next_retry_at = execution.resume_at = None
+        execution.finished_at = now_utc
+
+
+def cancel_schedule(
+    session: Session, schedule: TaskSchedule, now_utc: datetime
+) -> None:
+    schedule.status = "cancelled"
+    schedule.next_run_at = None
+    cancel_active_executions(session, now_utc, TaskExecution.schedule_id == schedule.id)
 
 
 TaskHandler = Callable[[TaskContext, BaseModel], Awaitable[TaskResult]]
@@ -120,8 +133,6 @@ class RegisteredTask:
     description: str
     parameter_schema: type[BaseModel]
     handler: TaskHandler
-    available: bool = True
-    unavailable_reason: str | None = None
 
 
 class TaskRegistry:
@@ -139,8 +150,6 @@ class TaskRegistry:
         module: str,
         display_name: str,
         description: str = "",
-        available: bool = True,
-        unavailable_reason: str | None = None,
     ) -> None:
         if task_type in self._tasks:
             raise DuplicateTaskTypeError(
@@ -153,9 +162,10 @@ class TaskRegistry:
             description=description,
             parameter_schema=parameter_schema,
             handler=handler,
-            available=available,
-            unavailable_reason=unavailable_reason,
         )
+
+    def __contains__(self, task_type: str) -> bool:
+        return task_type in self._tasks
 
     def get(self, task_type: str) -> RegisteredTask:
         if task_type not in self._tasks:
@@ -178,30 +188,6 @@ class TaskRegistry:
                 errors.append({"field": loc, "message": err.get("msg", "参数无效")})
             raise ParameterValidationError(errors) from exc
 
-    def sync_to_db(self, session: Session) -> None:
-        for reg in self._tasks.values():
-            schema_json = reg.parameter_schema.model_json_schema()
-            row = session.get(TaskDefinition, reg.task_type)
-            if row is None:
-                row = TaskDefinition(
-                    task_type=reg.task_type,
-                    module=reg.module,
-                    display_name=reg.display_name,
-                    description=reg.description,
-                    parameter_schema_json=schema_json,
-                    available=reg.available,
-                    unavailable_reason=reg.unavailable_reason,
-                )
-                session.add(row)
-            else:
-                row.module = reg.module
-                row.display_name = reg.display_name
-                row.description = reg.description
-                row.parameter_schema_json = schema_json
-                row.available = reg.available
-                row.unavailable_reason = reg.unavailable_reason
-        session.commit()
-
 
 def create_schedule(
     session: Session,
@@ -218,8 +204,6 @@ def create_schedule(
 ) -> TaskSchedule:
     clk = clock or default_clock
     reg = registry.get(task_type)
-    if not reg.available:
-        raise ValueError(reg.unavailable_reason or f"任务类型 {task_type} 当前不可用")
     validated_params = registry.validate_parameters(task_type, parameters)
     validate_trigger(trigger_type, trigger_config)
     now_utc = clk.now_utc()

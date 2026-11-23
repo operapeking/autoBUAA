@@ -26,9 +26,7 @@ RUN groupadd --gid 1000 autobuaa \
     && chown -R autobuaa:autobuaa /app /data
 
 ENV AUTOBUAA_DATA_DIR=/data \
-    AUTOBUAA_PORT=8080 \
     AUTOBUAA_FRONTEND_DIST_DIR=/app/frontend/dist \
-    AUTOBUAA_TIMEZONE=Asia/Shanghai \
     TZ=Asia/Shanghai \
     PYTHONPATH=/app/backend \
     PYTHONUNBUFFERED=1

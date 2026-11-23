@@ -3,9 +3,9 @@ import { onMounted, ref } from 'vue';
 import { api, setUnauthorizedHandler, type AuthStatus } from '@/api/client';
 import { Button } from '@/components/ui/button';
 import AuthGate from './views/AuthGate.vue';
-import ModulesView from './views/ModulesView.vue';
-import TasksView from './views/TasksView.vue';
-import AccountNetworkView from './views/AccountNetworkView.vue';
+import CampusView from './views/CampusView.vue';
+import ActivityView from './views/ActivityView.vue';
+import SettingsView from './views/SettingsView.vue';
 const auth = ref<AuthStatus>({ initialized: false, authenticated: false });
 const loading = ref(true), error = ref('');
 const tab = ref('campus');
@@ -19,7 +19,7 @@ onMounted(() => { setUnauthorizedHandler(() => { auth.value.authenticated = fals
   <AuthGate v-else-if="!auth.authenticated" :initialized="auth.initialized" @authenticated="authenticate" />
   <div v-else class="app-shell">
     <aside class="sidebar"><div class="brand"><span class="brand-mark">A</span><div><p class="font-semibold tracking-tight">autoBUAA</p><p class="text-xs text-muted-foreground mt-1">校园生活助手</p></div></div><nav class="nav-list" aria-label="主导航"><Button v-for="item in items" :key="item.id" :variant="tab === item.id ? 'secondary' : 'ghost'" class="justify-start gap-3 w-full" :aria-current="tab === item.id ? 'page' : undefined" @click="tab = item.id"><span aria-hidden="true" class="text-lg w-5">{{ item.symbol }}</span>{{ item.label }}</Button></nav><div class="sidebar-footer"><span class="text-xs text-muted-foreground">autoBUAA</span><Button variant="ghost" size="sm" @click="logout">退出登录</Button></div></aside>
-    <main class="main-area"><p v-if="error" role="alert" class="error-box mb-5">{{ error }}</p><ModulesView v-if="tab === 'campus'" /><TasksView v-else-if="tab === 'activity'" /><AccountNetworkView v-else /></main>
+    <main class="main-area"><p v-if="error" role="alert" class="error-box mb-5">{{ error }}</p><CampusView v-if="tab === 'campus'" /><ActivityView v-else-if="tab === 'activity'" /><SettingsView v-else /></main>
   </div>
   <p v-if="error && !auth.authenticated" role="alert" class="error-box fixed bottom-5 left-5">{{ error }}</p>
 </template>

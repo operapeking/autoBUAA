@@ -120,8 +120,9 @@ def test_settings_manage_schedules_and_validate_input(container):
         client.post("/api/v1/auth/setup", json={"password": "admin-secret"}).status_code
         == 200
     )
-    state = client.get("/api/v1/network").json()
+    modules = client.get("/api/v1/modules").json()
     for path in (
+        "/network",
         "/classroom/courses",
         "/boya/courses",
         "/ygdk/overview",
@@ -133,9 +134,9 @@ def test_settings_manage_schedules_and_validate_input(container):
         "/notifications/events",
     ):
         assert client.get("/api/v1" + path).status_code == 200
-    assert {mod["module"] for mod in state["modules"]} == {"classroom", "boya", "ygdk", "td"}
+    assert {mod["module"] for mod in modules} == {"classroom", "boya", "ygdk", "td"}
     enabled = client.put(
-        "/api/v1/network/modules/classroom",
+        "/api/v1/modules/classroom",
         json={"enabled": True, "config_json": {"auto_sign": False}},
     )
     assert enabled.status_code == 200
@@ -152,7 +153,7 @@ def test_settings_manage_schedules_and_validate_input(container):
         version = schedule.version
     # Repeated requests preserve the existing plan.
     client.put(
-        "/api/v1/network/modules/classroom",
+        "/api/v1/modules/classroom",
         json={"enabled": True, "config_json": {"auto_sign": False}},
     )
     with container.session_factory() as session:
@@ -170,21 +171,21 @@ def test_settings_manage_schedules_and_validate_input(container):
     ):
         assert (
             client.put(
-                "/api/v1/network/modules/classroom",
+                "/api/v1/modules/classroom",
                 json={"enabled": False, "config_json": config},
             ).status_code
             == 422
         )
     assert (
         client.put(
-            "/api/v1/network/modules/ygdk",
+            "/api/v1/modules/ygdk",
             json={"enabled": True, "config_json": {"reminder_time": "24:01"}},
         ).status_code
         == 422
     )
     assert (
         client.put(
-            "/api/v1/network/modules/classroom",
+            "/api/v1/modules/classroom",
             json={"enabled": False, "config_json": {}},
         ).status_code
         == 200
@@ -826,7 +827,7 @@ async def test_boya_reservation_cancel_pause_and_deadline(container, boya_reserv
     for enabled in (False, True):
         assert (
             client.put(
-                "/api/v1/network/modules/boya",
+                "/api/v1/modules/boya",
                 json={"enabled": enabled, "config_json": {"auto_sign": False}},
             ).status_code
             == 200
@@ -869,7 +870,7 @@ def test_boya_campus_filter_switch(container, boya_reservation):
     } == {901, 903}
     assert (
         client.put(
-            "/api/v1/network/modules/boya",
+            "/api/v1/modules/boya",
             json={"enabled": True, "config_json": {"filter_by_campus": False}},
         ).status_code
         == 200
@@ -898,7 +899,7 @@ async def test_boya_campus_reminders_and_refresh_preserve_reservation(
     )
     for enabled in (True, False):
         client.put(
-            "/api/v1/network/modules/boya",
+            "/api/v1/modules/boya",
             json={"enabled": True, "config_json": {"filter_by_campus": enabled}},
         )
         await sync_boya_all(

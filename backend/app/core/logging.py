@@ -46,8 +46,33 @@ class SensitiveRedactingFilter(logging.Filter):
 
 
 class RedactingFormatter(logging.Formatter):
+    """Also covers formatted tracebacks, which record filters cannot reach."""
+
     def format(self, record: logging.LogRecord) -> str:
         return redact_text(super().format(record))
+
+
+_REDACTING_FILTER = SensitiveRedactingFilter()
+
+
+def _install_file_handler(
+    root: logging.Logger, log_file: Path, formatter: logging.Formatter
+) -> None:
+    """A process owns one application log destination, including repeated app construction."""
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    target = str(log_file.resolve())
+    for existing in list(root.handlers):
+        if getattr(existing, "_autobuaa_file", False):
+            if getattr(existing, "baseFilename", None) == target:
+                return
+            root.removeHandler(existing)
+            existing.close()
+    file_handler = RotatingFileHandler(
+        target, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    file_handler._autobuaa_file = True  # type: ignore[attr-defined]
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
 
 
 def configure_logging(level: str = "DEBUG", log_file: Path | None = None) -> None:
@@ -57,26 +82,11 @@ def configure_logging(level: str = "DEBUG", log_file: Path | None = None) -> Non
         logging.getLogger(name).setLevel(logging.WARNING)
     formatter = RedactingFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        target = str(log_file.resolve())
-        # A process owns one application log destination, including repeated app construction.
-        for existing in list(root.handlers):
-            if getattr(existing, "_autobuaa_file", False):
-                if getattr(existing, "baseFilename", None) == target:
-                    return
-                root.removeHandler(existing)
-                existing.close()
-        file_handler = RotatingFileHandler(
-            target, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
-        )
-        file_handler._autobuaa_file = True
-        file_handler.setFormatter(formatter)
-        root.addHandler(file_handler)
+        _install_file_handler(root, log_file, formatter)
     if not root.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(formatter)
-        handler.addFilter(SensitiveRedactingFilter())
         root.addHandler(handler)
-    else:
-        for handler in root.handlers:
-            handler.addFilter(SensitiveRedactingFilter())
+    # Shared instance: addFilter() ignores duplicates across repeated configuration.
+    for handler in root.handlers:
+        handler.addFilter(_REDACTING_FILTER)

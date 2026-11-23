@@ -58,7 +58,6 @@ class CampusAccount(Base):
     auth_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     captcha_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     captcha_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    captcha_execution: Mapped[str | None] = mapped_column(Text, nullable=True)
     captcha_image_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
@@ -71,9 +70,6 @@ class ModuleConfig(Base):
 
     module: Mapped[str] = mapped_column(String(32), primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    network_mode: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="webvpn"
-    )
     config_json: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict
     )
@@ -160,23 +156,6 @@ class BusinessCacheSnapshot(Base):
         JSON, nullable=False, default=dict
     )
     synced_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
-
-
-class TaskDefinition(Base):
-    __tablename__ = "task_definitions"
-
-    task_type: Mapped[str] = mapped_column(String(64), primary_key=True)
-    module: Mapped[str] = mapped_column(String(32), nullable=False)
-    display_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    parameter_schema_json: Mapped[dict[str, Any]] = mapped_column(
-        JSON, nullable=False, default=dict
-    )
-    available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    unavailable_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime, default=utc_now, onupdate=utc_now
-    )
 
 
 class TaskSchedule(Base):

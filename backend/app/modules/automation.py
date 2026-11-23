@@ -1,16 +1,116 @@
-import re
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from app.core.time import Clock
-from app.db.models import (
-    ModuleConfig,
-    NotificationEvent,
-    TaskDefinition,
-    TaskExecution,
-    TaskSchedule,
+from app.db.models import ModuleConfig, NotificationEvent, TaskExecution, TaskSchedule
+from app.framework.tasks import (
+    TaskRegistry,
+    cancel_active_executions,
+    cancel_schedule,
+    create_schedule,
 )
-from app.framework.tasks import TaskRegistry, create_schedule
 from app.modules.config import MODULE_SETTINGS
+from app.notifications.service import REMINDER_EVENTS, expire_events
 from sqlalchemy.orm import Session
+
+
+@dataclass(frozen=True)
+class RefreshPlan:
+    task_type: str
+    name: str
+    trigger_type: str
+    trigger_config: Callable[[dict[str, Any]], dict[str, Any]]
+
+    @property
+    def business_key(self) -> str:
+        return self.task_type.replace(".", ":")
+
+
+REFRESH_PLANS: dict[str, RefreshPlan] = {
+    "classroom": RefreshPlan(
+        "classroom.sync_today",
+        "课堂课程更新",
+        "interval",
+        lambda _cfg: {"interval_seconds": 3600},
+    ),
+    "boya": RefreshPlan(
+        "boya.sync_courses",
+        "博雅课程更新",
+        "interval",
+        lambda _cfg: {"interval_seconds": 600},
+    ),
+    "ygdk": RefreshPlan(
+        "ygdk.sync_overview",
+        "阳光打卡进度更新",
+        "daily",
+        lambda cfg: {"time": cfg.get("reminder_time", "18:00")},
+    ),
+    "td": RefreshPlan(
+        "td.sync_overview",
+        "体能锻炼状态更新",
+        "interval",
+        lambda _cfg: {"interval_seconds": 3600},
+    ),
+}
+
+# Reservations are user intent and survive course refreshes; they only pause with the module.
+RESERVATION_TASK = "boya.auto_select"
+
+
+def cleanup_obsolete_state(
+    session: Session, registry: TaskRegistry, clock: Clock
+) -> None:
+    """Retire persisted state whose task type or module no longer exists in code."""
+    now = clock.now_utc()
+    for sched in session.query(TaskSchedule).filter(TaskSchedule.status != "cancelled"):
+        if sched.task_type not in registry:
+            cancel_schedule(session, sched, now)
+    session.flush()
+    cancelled = {
+        sched.id for sched in session.query(TaskSchedule).filter_by(status="cancelled")
+    }
+    for execution in session.query(TaskExecution).filter(
+        TaskExecution.status.in_(["pending", "waiting", "pending_confirm", "running"])
+    ):
+        if execution.task_type not in registry or execution.schedule_id in cancelled:
+            execution.status = "cancelled"
+            execution.next_retry_at = execution.resume_at = None
+            execution.finished_at = now
+    known_modules = {*MODULE_SETTINGS, "system", "auth", "*"}
+    expire_events(
+        event
+        for event in session.query(NotificationEvent).filter_by(status="pending")
+        if event.module not in known_modules
+    )
+    for mod in session.query(ModuleConfig).all():
+        schema = MODULE_SETTINGS.get(mod.module)
+        if schema is None:
+            session.delete(mod)
+            continue
+        known = {k: v for k, v in mod.config_json.items() if k in schema.model_fields}
+        mod.config_json = schema.model_validate(known).model_dump()
+    session.flush()
+
+
+def reconcile_automation(
+    session: Session,
+    registry: TaskRegistry,
+    clock: Clock,
+    *,
+    changed: str | None = None,
+) -> None:
+    """Align persisted schedules with module switches.
+
+    `changed` names a module whose settings were just edited: its course windows and
+    reminders are dropped and its refresh task runs immediately to rebuild them.
+    """
+    for module in MODULE_SETTINGS if changed is None else (changed,):
+        mod = session.get(ModuleConfig, module)
+        if mod is not None:
+            _reconcile_module(session, registry, clock, mod, rebuild=module == changed)
+    session.flush()
 
 
 def refresh_enabled_modules(
@@ -25,193 +125,69 @@ def refresh_enabled_modules(
 def request_module_refresh(session: Session, module: str, clock: Clock) -> None:
     schedule = (
         session.query(TaskSchedule)
-        .filter(
-            TaskSchedule.module == module,
-            TaskSchedule.trigger_type.in_(["interval", "daily"]),
-            TaskSchedule.status == "enabled",
-        )
+        .filter_by(business_key=REFRESH_PLANS[module].business_key, status="enabled")
         .first()
     )
     if schedule:
         schedule.next_run_at = clock.now_utc()
 
 
-def reconcile_automation(
+def _reconcile_module(
     session: Session,
     registry: TaskRegistry,
     clock: Clock,
+    mod: ModuleConfig,
     *,
-    changed: str | None = None,
+    rebuild: bool,
 ) -> None:
-    """Reconcile business switches with persisted schedules in the same transaction."""
     now = clock.now_utc()
-    supported = {task.task_type for task in registry.all()}
-    plans = {
-        "classroom.sync_today": ("interval", r"classroom:sync_today"),
-        "boya.sync_courses": ("interval", r"boya:sync_courses"),
-        "ygdk.sync_overview": ("daily", r"ygdk:sync_overview"),
-        "td.sync_overview": ("interval", r"td:sync_overview"),
-        "classroom.auto_signin": ("window", r"classroom:signin:\d{8}:.+"),
-        "boya.auto_signin": ("window", r"boya:sign:\d+"),
-        "boya.auto_signout": ("window", r"boya:signout:\d+"),
-        "boya.auto_select": ("window", r"boya:reserve:\d+"),
-    }
-    for sched in session.query(TaskSchedule).all():
-        spec = plans.get(sched.task_type)
-        if (
-            sched.task_type not in supported
-            or spec is None
-            or sched.trigger_type != spec[0]
-            or re.fullmatch(spec[1], sched.business_key or "") is None
-        ):
-            sched.status = "cancelled"
-            sched.next_run_at = None
-    for execution in (
-        session.query(TaskExecution)
-        .filter(
-            TaskExecution.status.in_(
-                ["pending", "waiting", "pending_confirm", "running"]
-            )
-        )
-        .all()
+    plan = REFRESH_PLANS[mod.module]
+    trigger_config = plan.trigger_config(mod.config_json)
+    refresh = (
+        session.query(TaskSchedule).filter_by(business_key=plan.business_key).first()
+    )
+    if (
+        refresh is None
+        or refresh.trigger_config_json != trigger_config
+        or refresh.status != ("enabled" if mod.enabled else "paused")
     ):
-        schedule = (
-            session.get(TaskSchedule, execution.schedule_id)
-            if execution.schedule_id
-            else None
+        refresh = create_schedule(
+            session,
+            registry,
+            name=plan.name,
+            task_type=plan.task_type,
+            parameters={},
+            trigger_type=plan.trigger_type,
+            trigger_config=trigger_config,
+            business_key=plan.business_key,
+            enabled=mod.enabled,
+            clock=clock,
         )
-        if execution.task_type not in supported or (
-            schedule and schedule.status == "cancelled"
+        if mod.enabled:
+            refresh.next_run_at = now
+    elif rebuild and mod.enabled:
+        refresh.next_run_at = now
+
+    auto_sign = mod.config_json.get("auto_sign", True)
+    for sched in session.query(TaskSchedule).filter(
+        TaskSchedule.module == mod.module, TaskSchedule.id != refresh.id
+    ):
+        if sched.task_type == RESERVATION_TASK:
+            if not mod.enabled and sched.status == "enabled":
+                sched.status, sched.next_run_at = "paused", None
+            elif mod.enabled and sched.status == "paused":
+                sched.status, sched.next_run_at = "enabled", now
+        elif sched.status == "enabled" and (
+            not mod.enabled or rebuild or not auto_sign
         ):
-            execution.status = "cancelled"
-            execution.next_retry_at = execution.resume_at = None
-            execution.finished_at = now
-    for event in session.query(NotificationEvent).filter_by(status="pending").all():
-        if (
-            event.module not in {*MODULE_SETTINGS, "system", "auth", "*"}
-            or event.event_type == "course_discovered"
-        ):
-            event.status = "expired"
-            event.next_retry_at = None
-    for definition in session.query(TaskDefinition).all():
-        if definition.task_type not in supported:
-            session.delete(definition)
-    for mod in session.query(ModuleConfig).all():
-        if mod.module not in MODULE_SETTINGS:
-            session.delete(mod)
-            continue
-        schema = MODULE_SETTINGS[mod.module]
-        config_values = {
-            k: v for k, v in (mod.config_json or {}).items() if k in schema.model_fields
-        }
-        if "signin_offset_minutes" in config_values:
-            config_values["signin_offset_minutes"] = max(
-                -5, min(29, int(config_values["signin_offset_minutes"]))
+            sched.status, sched.next_run_at = "paused", None
+
+    if not mod.enabled or rebuild:
+        cancel_active_executions(session, now, TaskExecution.module == mod.module)
+        expire_events(
+            event
+            for event in session.query(NotificationEvent).filter_by(
+                module=mod.module, status="pending"
             )
-        mod.config_json = schema.model_validate(config_values).model_dump()
-        if changed and mod.module != changed:
-            continue
-        refresh = {
-            "td": (
-                "td.sync_overview",
-                "体能锻炼状态更新",
-                "interval",
-                {"interval_seconds": 3600},
-            ),
-            "classroom": (
-                "classroom.sync_today",
-                "课堂课程更新",
-                "interval",
-                {"interval_seconds": 3600},
-            ),
-            "boya": (
-                "boya.sync_courses",
-                "博雅课程更新",
-                "interval",
-                {"interval_seconds": 600},
-            ),
-            "ygdk": (
-                "ygdk.sync_overview",
-                "阳光打卡进度更新",
-                "daily",
-                {"time": mod.config_json.get("reminder_time", "18:00")},
-            ),
-        }[mod.module]
-        task_type, name, trigger, config = refresh
-        key = {
-            "td": "td:sync_overview",
-            "classroom": "classroom:sync_today",
-            "boya": "boya:sync_courses",
-            "ygdk": "ygdk:sync_overview",
-        }[mod.module]
-        old = session.query(TaskSchedule).filter_by(business_key=key).first()
-        desired_status = "enabled" if mod.enabled else "paused"
-        if (
-            old is None
-            or old.trigger_config_json != config
-            or old.status != desired_status
-        ):
-            old = create_schedule(
-                session,
-                registry,
-                name=name,
-                task_type=task_type,
-                parameters={},
-                trigger_type=trigger,
-                trigger_config=config,
-                business_key=key,
-                enabled=mod.enabled,
-                clock=clock,
-            )
-            if mod.enabled:
-                old.next_run_at = now
-        elif changed == mod.module and mod.enabled:
-            old.next_run_at = now
-        # Every changed configuration rebuilds course windows from fresh platform data.
-        for sched in (
-            session.query(TaskSchedule)
-            .filter(TaskSchedule.module == mod.module, TaskSchedule.id != old.id)
-            .all()
-        ):
-            if sched.task_type == "boya.auto_select":
-                if not mod.enabled and sched.status == "enabled":
-                    sched.status = "paused"
-                    sched.next_run_at = None
-                elif mod.enabled and sched.status == "paused":
-                    sched.status = "enabled"
-                    sched.next_run_at = now
-                continue
-            if (
-                not mod.enabled
-                or changed == mod.module
-                or not mod.config_json.get("auto_sign", True)
-            ):
-                if sched.status == "enabled":
-                    sched.status = "paused"
-                    sched.next_run_at = None
-        if not mod.enabled or changed == mod.module:
-            for ex in (
-                session.query(TaskExecution)
-                .filter(
-                    TaskExecution.module == mod.module,
-                    TaskExecution.status.in_(["pending", "waiting", "pending_confirm"]),
-                )
-                .all()
-            ):
-                ex.status = "cancelled"
-                ex.next_retry_at = ex.resume_at = None
-                ex.finished_at = now
-            for event in (
-                session.query(NotificationEvent)
-                .filter_by(module=mod.module, status="pending")
-                .all()
-            ):
-                if not mod.enabled or event.event_type in {
-                    "signup_reminder",
-                    "signin_reminder",
-                    "signout_reminder",
-                    "exercise_reminder",
-                }:
-                    event.status = "expired"
-                    event.next_retry_at = None
-    session.flush()
+            if not mod.enabled or event.event_type in REMINDER_EVENTS
+        )

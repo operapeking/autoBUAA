@@ -5,7 +5,8 @@ from typing import Any, Literal
 
 from app.api.deps import require_admin
 from app.buaa.exceptions import CaptchaRequiredError, LoginFailedError
-from app.core.network import VALID_NETWORK_MODES, NetworkMode, get_unified_network_mode
+from app.container import AppContainer
+from app.core.network import read_network_mode
 from app.core.time import format_shanghai_iso
 from app.db.models import CampusAccount
 from app.modules.automation import refresh_enabled_modules
@@ -25,10 +26,6 @@ class AccountUpdatePayload(BaseModel):
 
 class CaptchaSubmitPayload(BaseModel):
     code: str = Field(..., min_length=1, max_length=32)
-
-
-class LoginRequestPayload(BaseModel):
-    network_mode: NetworkMode | None = None
 
 
 def _serialize_account(account: CampusAccount) -> dict[str, Any]:
@@ -51,145 +48,92 @@ def _serialize_account(account: CampusAccount) -> dict[str, Any]:
     }
 
 
-def _preferred_network_mode(container: Any) -> str:
-    with container.session_factory() as session:
-        return get_unified_network_mode(session)
-
-
 @router.get("")
-def get_account(container: Any = Depends(require_admin)) -> dict[str, Any]:
+def get_account(container: AppContainer = Depends(require_admin)) -> dict[str, Any]:
     with container.session_factory() as session:
-        account = session.query(CampusAccount).first()
-        if account is None:
-            account = CampusAccount(
-                student_id="", campus="北京", auth_status="unconfigured"
-            )
-            session.add(account)
-            session.commit()
-            session.refresh(account)
-        return _serialize_account(account)
+        return _serialize_account(session.query(CampusAccount).one())
 
 
 @router.put("")
 def update_account(
-    payload: AccountUpdatePayload,
-    container: Any = Depends(require_admin),
+    payload: AccountUpdatePayload, container: AppContainer = Depends(require_admin)
 ) -> dict[str, Any]:
+    student_id = payload.student_id.strip()
     with container.session_factory() as session:
-        account = session.query(CampusAccount).first()
-        if account is None:
-            account = CampusAccount()
-            session.add(account)
-        student_changed = account.student_id != payload.student_id.strip()
-        account.student_id = payload.student_id.strip()
+        account = session.query(CampusAccount).one()
+        credentials_changed = account.student_id != student_id or bool(payload.password)
+        account.student_id = student_id
         if payload.password:
             account.encrypted_password = container.cipher.encrypt(payload.password)
         account.campus = payload.campus
         account.enabled = payload.enabled
-        if student_changed or payload.password:
+        if credentials_changed:
             account.auth_status = (
                 "configured" if account.encrypted_password else "unconfigured"
             )
             account.auth_error = None
         session.commit()
-        session.refresh(account)
-    if student_changed or payload.password:
-        for mode in VALID_NETWORK_MODES:
-            container.session_mgr.clear_domain_state(f"sso:{mode}")
-            container.session_mgr.clear_domain_state(f"iclass:{mode}")
-            container.session_mgr.clear_domain_state(f"ygdk:{mode}")
-            container.session_mgr.clear_domain_state(f"bykc:{mode}")
-            container.session_mgr.clear_domain_state(f"vpn_pending:{mode}")
-            container.session_mgr.clear_domain_state(f"sso_pending:{mode}")
-    return _serialize_account(account)
+        result = _serialize_account(account)
+    if credentials_changed:
+        container.session_mgr.clear_all_states()
+    return result
 
 
-@router.post("/login")
-async def login_account(
-    payload: LoginRequestPayload | None = None,
-    container: Any = Depends(require_admin),
+async def _login(
+    container: AppContainer, captcha_code: str | None = None
 ) -> dict[str, Any]:
-    mode = (
-        payload.network_mode if payload and payload.network_mode else None
-    ) or _preferred_network_mode(container)
     try:
-        info = await container.session_mgr.login_sso(network_mode=mode)
-        with container.session_factory() as session:
-            refresh_enabled_modules(session, container.registry, container.clock)
-            session.commit()
-            account = session.query(CampusAccount).first()
-            return {
-                "ok": True,
-                "status": "authenticated",
-                "display_name": info.get("name")
-                or (account.display_name if account else ""),
-                "account": _serialize_account(account) if account else None,
-            }
+        info = await container.session_mgr.login_sso(
+            network_mode=read_network_mode(container.session_factory),
+            captcha_code=captcha_code,
+        )
     except CaptchaRequiredError as exc:
         with container.session_factory() as session:
-            account = session.query(CampusAccount).first()
             return {
                 "ok": False,
                 "status": "captcha_required",
                 "message": str(exc),
-                "account": _serialize_account(account) if account else None,
+                "account": _serialize_account(session.query(CampusAccount).one()),
             }
     except LoginFailedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"认证请求异常: {exc}"
+            status.HTTP_502_BAD_GATEWAY, f"认证请求异常: {exc}"
         ) from exc
+    with container.session_factory() as session:
+        refresh_enabled_modules(session, container.registry, container.clock)
+        session.commit()
+        account = session.query(CampusAccount).one()
+        return {
+            "ok": True,
+            "status": "authenticated",
+            "display_name": info.get("name") or account.display_name or "",
+            "account": _serialize_account(account),
+        }
+
+
+@router.post("/login")
+async def login_account(
+    container: AppContainer = Depends(require_admin),
+) -> dict[str, Any]:
+    return await _login(container)
 
 
 @router.get("/captcha/image")
-def get_captcha_image(container: Any = Depends(require_admin)) -> FileResponse:
+def get_captcha_image(container: AppContainer = Depends(require_admin)) -> FileResponse:
     with container.session_factory() as session:
-        account = session.query(CampusAccount).first()
-        if account is None or not account.captcha_image_path:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="当前没有待处理的验证码"
-            )
-        path = Path(account.captcha_image_path)
+        image_path = session.query(CampusAccount).one().captcha_image_path
+    if not image_path:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "当前没有待处理的验证码")
+    path = Path(image_path)
     if not path.exists():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="验证码图片文件不存在"
-        )
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "验证码图片文件不存在")
     return FileResponse(path)
 
 
 @router.post("/captcha")
 async def submit_captcha(
-    payload: CaptchaSubmitPayload,
-    container: Any = Depends(require_admin),
+    payload: CaptchaSubmitPayload, container: AppContainer = Depends(require_admin)
 ) -> dict[str, Any]:
-    mode = _preferred_network_mode(container)
-    try:
-        info = await container.session_mgr.login_sso(
-            network_mode=mode, captcha_code=payload.code.strip()
-        )
-        with container.session_factory() as session:
-            refresh_enabled_modules(session, container.registry, container.clock)
-            session.commit()
-            account = session.query(CampusAccount).first()
-            return {
-                "ok": True,
-                "status": "authenticated",
-                "display_name": info.get("name") or "",
-                "account": _serialize_account(account) if account else None,
-            }
-    except CaptchaRequiredError as exc:
-        with container.session_factory() as session:
-            account = session.query(CampusAccount).first()
-            return {
-                "ok": False,
-                "status": "captcha_required",
-                "message": str(exc),
-                "account": _serialize_account(account) if account else None,
-            }
-    except LoginFailedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
+    return await _login(container, payload.code.strip())

@@ -6,11 +6,11 @@ from app.core.config import Settings, get_settings
 from app.core.crypto import SecretCipher
 from app.core.logging import configure_logging
 from app.core.time import Clock
-from app.db.base import build_engine, build_session_factory
-from app.db.init_db import init_database
+from app.db import init_db
+from app.db.base import Base, build_engine, build_session_factory
 from app.framework.scheduler import UnifiedScheduler
 from app.framework.tasks import TaskRegistry
-from app.modules.automation import reconcile_automation
+from app.modules.automation import cleanup_obsolete_state, reconcile_automation
 from app.modules.tasks import register_all_tasks
 from app.notifications.service import NotificationDispatcher
 
@@ -36,16 +36,10 @@ class AppContainer:
         self.cipher = SecretCipher(self.settings.resolved_secret_key_file)
         self.engine = build_engine(self.settings.db_url)
         self.session_factory = build_session_factory(self.engine)
-
         if run_migrations:
-            init_database(self.engine, self.settings.db_url, self.session_factory)
+            init_db.run_migrations(self.settings.db_url)
         else:
-            from app.db.base import Base
-            from app.db.init_db import seed_defaults
-
             Base.metadata.create_all(self.engine)
-            with self.session_factory() as session:
-                seed_defaults(session)
 
         self.registry = TaskRegistry()
         self.session_mgr = BuaaSessionManager(
@@ -58,7 +52,8 @@ class AppContainer:
         register_all_tasks(self.registry, self.session_mgr)
 
         with self.session_factory() as session:
-            self.registry.sync_to_db(session)
+            init_db.seed_defaults(session)
+            cleanup_obsolete_state(session, self.registry, self.clock)
             reconcile_automation(session, self.registry, self.clock)
             session.commit()
 
@@ -71,7 +66,6 @@ class AppContainer:
         self.scheduler = UnifiedScheduler(
             self.session_factory,
             self.registry,
-            self.cipher,
             self.notification_dispatcher,
             clock=self.clock,
             concurrency=self.settings.scheduler_concurrency,

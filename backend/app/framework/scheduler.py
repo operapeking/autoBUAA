@@ -5,17 +5,9 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
-from app.core.crypto import SecretCipher
 from app.core.time import Clock, default_clock, ensure_utc
-from app.db.models import (
-    CampusAccount,
-    ModuleConfig,
-    TaskDefinition,
-    TaskExecution,
-    TaskSchedule,
-    TaskStage,
-)
-from app.framework.tasks import TaskContext, TaskRegistry, TaskResult
+from app.db.models import CampusAccount, ModuleConfig, TaskExecution, TaskSchedule
+from app.framework.tasks import TaskContext, TaskRegistry, TaskResult, upsert_stage
 from app.framework.triggers import compute_deadline, compute_next_run
 from app.notifications.service import NotificationDispatcher, publish_event
 from sqlalchemy.exc import IntegrityError
@@ -24,6 +16,10 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 QUERY_RETRY_DELAYS = (5, 15, 45)
+ACTIVE_STATUSES = ("pending", "running", "waiting", "pending_confirm")
+TERMINAL_STATUSES = {"succeeded", "failed", "expired", "skipped", "cancelled"}
+AUTO_SIGN_TASKS = {"classroom.auto_signin", "boya.auto_signin", "boya.auto_signout"}
+EXPIRED_SUMMARY = "已超过任务有效时间"
 
 MODULE_NAMES = {
     "classroom": "课堂签到",
@@ -33,31 +29,6 @@ MODULE_NAMES = {
 }
 
 
-def publish_failure(session: Session, ex: TaskExecution, clock: Clock) -> None:
-    label = None
-    if ex.schedule_id:
-        sched = session.get(TaskSchedule, ex.schedule_id)
-        label = sched.name if sched else None
-    if not label:
-        definition = session.get(TaskDefinition, ex.task_type)
-        label = (definition.display_name if definition else None) or ex.task_type
-    action, sep, obj = label.partition(": ")
-    title = f"{action}失败: {obj}" if sep else f"{label}失败"
-    publish_event(
-        session,
-        event_type="task_failed",
-        module=ex.module,
-        event_key=f"task:failed:{ex.business_key or ex.task_type}:{clock.now_shanghai().date()}",
-        payload={
-            "title": title,
-            "reason": ex.result_summary or ex.error_message or "已超过任务有效时间",
-        },
-        execution_id=ex.id,
-        schedule_id=ex.schedule_id,
-        clock=clock,
-    )
-
-
 class UnifiedScheduler:
     """Persistent business scheduler driven by one asyncio loop."""
 
@@ -65,7 +36,6 @@ class UnifiedScheduler:
         self,
         session_factory: Any,
         registry: TaskRegistry,
-        cipher: SecretCipher,
         notification_dispatcher: NotificationDispatcher,
         clock: Clock | None = None,
         concurrency: int = 4,
@@ -73,13 +43,11 @@ class UnifiedScheduler:
     ) -> None:
         self.session_factory = session_factory
         self.registry = registry
-        self.cipher = cipher
         self.notification_dispatcher = notification_dispatcher
         self.clock = clock or default_clock
-        self.concurrency = max(1, concurrency)
         self.poll_seconds = poll_seconds
 
-        self._semaphore = asyncio.Semaphore(self.concurrency)
+        self._semaphore = asyncio.Semaphore(max(1, concurrency))
         self._module_locks: dict[str, asyncio.Lock] = {}
         self._runner: asyncio.Task[None] | None = None
         self._tick_lock = asyncio.Lock()
@@ -87,9 +55,7 @@ class UnifiedScheduler:
         self.last_heartbeat_at: datetime | None = None
 
     def module_lock(self, module: str) -> asyncio.Lock:
-        if module not in self._module_locks:
-            self._module_locks[module] = asyncio.Lock()
-        return self._module_locks[module]
+        return self._module_locks.setdefault(module, asyncio.Lock())
 
     @property
     def running(self) -> bool:
@@ -116,58 +82,86 @@ class UnifiedScheduler:
         if self._inflight:
             await asyncio.gather(*list(self._inflight), return_exceptions=True)
 
+    def _publish_failure(self, session: Session, ex: TaskExecution) -> None:
+        sched = session.get(TaskSchedule, ex.schedule_id) if ex.schedule_id else None
+        label = sched.name if sched else None
+        if not label:
+            label = (
+                self.registry.get(ex.task_type).display_name
+                if ex.task_type in self.registry
+                else ex.task_type
+            )
+        action, sep, obj = label.partition(": ")
+        publish_event(
+            session,
+            event_type="task_failed",
+            module=ex.module,
+            event_key=f"task:failed:{ex.business_key or ex.task_type}:{self.clock.now_shanghai().date()}",
+            payload={
+                "title": f"{action}失败: {obj}" if sep else f"{label}失败",
+                "reason": ex.result_summary or ex.error_message or EXPIRED_SUMMARY,
+            },
+            execution_id=ex.id,
+            schedule_id=ex.schedule_id,
+            clock=self.clock,
+        )
+
+    def _expire_execution(
+        self,
+        session: Session,
+        ex: TaskExecution,
+        now_utc: datetime,
+        error_message: str | None = None,
+    ) -> None:
+        """Mark an execution past its deadline and close its one-shot schedule."""
+        ex.status = "expired"
+        ex.finished_at = now_utc
+        ex.next_retry_at = ex.resume_at = None
+        ex.result_summary = EXPIRED_SUMMARY
+        if error_message:
+            ex.error_message = error_message
+        self._publish_failure(session, ex)
+        sched = session.get(TaskSchedule, ex.schedule_id) if ex.schedule_id else None
+        if sched and sched.trigger_type in {"once", "window"}:
+            sched.status = "completed"
+            sched.next_run_at = None
+            sched.last_result_status = "expired"
+            sched.last_result_summary = EXPIRED_SUMMARY
+
     def recover_on_startup(self) -> None:
         """Recover interrupted executions and stale schedule triggers after restart."""
         now_utc = self.clock.now_utc()
         with self.session_factory() as session:
-            interrupted = (
-                session.query(TaskExecution)
-                .filter(TaskExecution.status == "running")
-                .all()
-            )
-            for ex in interrupted:
+            for ex in session.query(TaskExecution).filter_by(status="running").all():
                 if ex.deadline_at and now_utc >= ex.deadline_at:
-                    ex.status = "expired"
-                    ex.finished_at = now_utc
-                    ex.error_message = "服务停机期间已超过任务有效时间"
-                    ex.result_summary = "已超过任务有效时间"
-                    publish_failure(session, ex, self.clock)
+                    self._expire_execution(
+                        session, ex, now_utc, "服务停机期间已超过任务有效时间"
+                    )
                 else:
                     ex.status = "pending"
                     ex.next_retry_at = now_utc
                     ex.wait_reason = "服务重启，等待重新执行"
 
-            enabled_schedules = (
+            stale = (
                 session.query(TaskSchedule)
-                .filter(TaskSchedule.status == "enabled")
+                .filter(
+                    TaskSchedule.status == "enabled",
+                    TaskSchedule.trigger_type.in_(["once", "window"]),
+                    TaskSchedule.next_run_at < now_utc,
+                )
                 .all()
             )
-            for sched in enabled_schedules:
-                if sched.next_run_at and sched.next_run_at < now_utc:
-                    if sched.trigger_type == "window":
-                        end_at = compute_deadline(
-                            sched.trigger_type,
-                            sched.trigger_config_json,
-                            sched.next_run_at,
-                        )
-                        if end_at and now_utc >= end_at:
-                            sched.status = "completed"
-                            sched.next_run_at = None
-                            sched.last_result_status = "expired"
-                            sched.last_result_summary = "服务停机期间已超过任务有效时间"
-                            continue
-                    elif sched.trigger_type == "once":
-                        deadline = compute_deadline(
-                            sched.trigger_type,
-                            sched.trigger_config_json,
-                            sched.next_run_at,
-                        )
-                        if deadline and now_utc >= deadline:
-                            sched.status = "completed"
-                            sched.next_run_at = None
-                            sched.last_result_status = "expired"
-                            sched.last_result_summary = "服务停机期间已超过任务有效时间"
-                            continue
+            for sched in stale:
+                if sched.status != "enabled" or sched.next_run_at is None:
+                    continue  # already closed by an expired execution above
+                deadline = compute_deadline(
+                    sched.trigger_type, sched.trigger_config_json, sched.next_run_at
+                )
+                if deadline and now_utc >= deadline:
+                    sched.status = "completed"
+                    sched.next_run_at = None
+                    sched.last_result_status = "expired"
+                    sched.last_result_summary = "服务停机期间已超过任务有效时间"
             session.commit()
 
     def _check_module_blocking(
@@ -175,22 +169,17 @@ class UnifiedScheduler:
     ) -> str | None:
         if module == "system":
             return None
-        if task_type not in {reg.task_type for reg in self.registry.all()}:
+        if task_type not in self.registry:
             return "任务类型不可用"
 
         mod_cfg = session.get(ModuleConfig, module)
-        if mod_cfg is not None and not mod_cfg.enabled:
-            return f"{MODULE_NAMES.get(module, module)}模块未启用"
-        if (
-            mod_cfg
-            and "auto_sign" in task_type
-            and not (mod_cfg.config_json or {}).get("auto_sign", True)
-        ):
-            return "自动签到已关闭"
-
-        reg = self.registry.get(task_type)
-        if not reg.available:
-            return reg.unavailable_reason or "任务类型当前不可用"
+        if mod_cfg is not None:
+            if not mod_cfg.enabled:
+                return f"{MODULE_NAMES.get(module, module)}模块未启用"
+            if task_type in AUTO_SIGN_TASKS and not mod_cfg.config_json.get(
+                "auto_sign", True
+            ):
+                return "自动签到已关闭"
 
         account = session.query(CampusAccount).first()
         if account is not None:
@@ -214,7 +203,6 @@ class UnifiedScheduler:
                     session.query(TaskSchedule)
                     .filter(
                         TaskSchedule.status == "enabled",
-                        TaskSchedule.next_run_at.is_not(None),
                         TaskSchedule.next_run_at <= now_utc,
                     )
                     .order_by(TaskSchedule.next_run_at.asc(), TaskSchedule.id.asc())
@@ -225,67 +213,41 @@ class UnifiedScheduler:
                     if ex_id is not None:
                         claimed_ids.append(ex_id)
 
+                retry_due = TaskExecution.status.in_(["pending", "pending_confirm"]) & (
+                    TaskExecution.next_retry_at.is_(None)
+                    | (TaskExecution.next_retry_at <= now_utc)
+                )
+                resume_due = (TaskExecution.status == "waiting") & (
+                    TaskExecution.resume_at <= now_utc
+                )
                 due_retries = (
                     session.query(TaskExecution)
-                    .filter(
-                        TaskExecution.status.in_(
-                            ["pending", "waiting", "pending_confirm"]
-                        ),
-                        (
-                            (
-                                (
-                                    TaskExecution.status.in_(
-                                        ["pending", "pending_confirm"]
-                                    )
-                                )
-                                & (
-                                    TaskExecution.next_retry_at.is_(None)
-                                    | (TaskExecution.next_retry_at <= now_utc)
-                                )
-                            )
-                            | (
-                                (TaskExecution.status == "waiting")
-                                & (
-                                    TaskExecution.resume_at.is_not(None)
-                                    & (TaskExecution.resume_at <= now_utc)
-                                )
-                            )
-                        ),
-                    )
+                    .filter(retry_due | resume_due)
                     .order_by(TaskExecution.id.asc())
                     .limit(20)
                     .all()
                 )
                 for ex in due_retries:
-                    if ex.id not in claimed_ids:
-                        if ex.deadline_at and now_utc >= ex.deadline_at:
-                            ex.status = "expired"
-                            ex.finished_at = now_utc
-                            ex.result_summary = "已超过任务有效时间"
-                            publish_failure(session, ex, self.clock)
-                            if ex.schedule_id:
-                                sched = session.get(TaskSchedule, ex.schedule_id)
-                                if sched and sched.trigger_type in {"once", "window"}:
-                                    sched.status = "completed"
-                                    sched.next_run_at = None
-                                    sched.last_result_status = "expired"
-                                    sched.last_result_summary = ex.result_summary
+                    if ex.id in claimed_ids:
+                        continue
+                    if ex.deadline_at and now_utc >= ex.deadline_at:
+                        self._expire_execution(session, ex, now_utc)
+                        continue
+                    if ex.schedule_id:
+                        sched = session.get(TaskSchedule, ex.schedule_id)
+                        if sched and sched.status in {"paused", "cancelled"}:
                             continue
-                        if ex.schedule_id:
-                            sched = session.get(TaskSchedule, ex.schedule_id)
-                            if sched and sched.status in {"paused", "cancelled"}:
-                                continue
-                            block_reason = self._check_module_blocking(
-                                session, ex.task_type, ex.module
-                            )
-                            if block_reason:
-                                if sched:
-                                    sched.blocking_reason = block_reason
-                                ex.wait_reason = block_reason
-                                ex.resume_at = now_utc + timedelta(seconds=30)
-                                ex.status = "waiting"
-                                continue
-                        claimed_ids.append(ex.id)
+                        block_reason = self._check_module_blocking(
+                            session, ex.task_type, ex.module
+                        )
+                        if block_reason:
+                            if sched:
+                                sched.blocking_reason = block_reason
+                            ex.status = "waiting"
+                            ex.wait_reason = block_reason
+                            ex.resume_at = now_utc + timedelta(seconds=30)
+                            continue
+                    claimed_ids.append(ex.id)
 
                 session.commit()
 
@@ -306,73 +268,22 @@ class UnifiedScheduler:
         due_at = sched.next_run_at
         assert due_at is not None
 
-        # Compute next future trigger (coalescing missed runs)
-        if sched.trigger_type == "once":
-            sched.next_run_at = None
-        else:
-            sched.next_run_at = compute_next_run(
+        # Coalesce missed runs into the next future trigger.
+        sched.next_run_at = (
+            None
+            if sched.trigger_type == "once"
+            else compute_next_run(
                 sched.trigger_type,
                 sched.trigger_config_json,
                 max(now_utc, due_at),
                 inclusive=False,
             )
-            if sched.next_run_at is None and sched.trigger_type == "window":
-                # Keep enabled until execution finishes or expires
-                pass
-
+        )
         if sched.trigger_type in {"daily", "interval"}:
             due_at = now_utc
         deadline = compute_deadline(
             sched.trigger_type, sched.trigger_config_json, due_at
         )
-        if deadline and now_utc >= deadline:
-            ex = TaskExecution(
-                schedule_id=sched.id,
-                schedule_version=sched.version,
-                task_type=sched.task_type,
-                module=sched.module,
-                business_key=sched.business_key,
-                scheduled_for=due_at,
-                deadline_at=deadline,
-                status="expired",
-                stage="init",
-                finished_at=now_utc,
-                result_summary="已超过任务有效时间",
-            )
-            try:
-                with session.begin_nested():
-                    session.add(ex)
-                    session.flush()
-                    publish_failure(session, ex, self.clock)
-            except IntegrityError:
-                return None
-            if sched.trigger_type in {"once", "window"} and sched.next_run_at is None:
-                sched.status = "completed"
-            sched.last_result_status = "expired"
-            sched.last_result_summary = ex.result_summary
-            return None
-
-        block_reason = self._check_module_blocking(
-            session, sched.task_type, sched.module
-        )
-        if block_reason:
-            sched.blocking_reason = block_reason
-            return None
-        sched.blocking_reason = None
-
-        running = (
-            session.query(TaskExecution)
-            .filter(
-                TaskExecution.schedule_id == sched.id,
-                TaskExecution.status.in_(
-                    ["pending", "running", "waiting", "pending_confirm"]
-                ),
-            )
-            .first()
-        )
-        if running is not None:
-            return None
-
         ex = TaskExecution(
             schedule_id=sched.id,
             schedule_version=sched.version,
@@ -381,10 +292,46 @@ class UnifiedScheduler:
             business_key=sched.business_key,
             scheduled_for=due_at,
             deadline_at=deadline,
-            status="pending",
             stage="init",
-            next_retry_at=now_utc,
         )
+
+        if deadline and now_utc >= deadline:
+            ex.status = "expired"
+            ex.finished_at = now_utc
+            ex.result_summary = EXPIRED_SUMMARY
+            try:
+                with session.begin_nested():
+                    session.add(ex)
+                    session.flush()
+                    self._publish_failure(session, ex)
+            except IntegrityError:
+                return None
+            if sched.trigger_type in {"once", "window"} and sched.next_run_at is None:
+                sched.status = "completed"
+            sched.last_result_status = "expired"
+            sched.last_result_summary = EXPIRED_SUMMARY
+            return None
+
+        block_reason = self._check_module_blocking(
+            session, sched.task_type, sched.module
+        )
+        sched.blocking_reason = block_reason
+        if block_reason:
+            return None
+
+        active = (
+            session.query(TaskExecution)
+            .filter(
+                TaskExecution.schedule_id == sched.id,
+                TaskExecution.status.in_(ACTIVE_STATUSES),
+            )
+            .first()
+        )
+        if active is not None:
+            return None
+
+        ex.status = "pending"
+        ex.next_retry_at = now_utc
         try:
             with session.begin_nested():
                 session.add(ex)
@@ -398,52 +345,50 @@ class UnifiedScheduler:
             now_utc = self.clock.now_utc()
             with self.session_factory() as session:
                 ex = session.get(TaskExecution, execution_id)
-                if ex is None or ex.status in {
-                    "succeeded",
-                    "failed",
-                    "expired",
-                    "skipped",
-                    "cancelled",
-                }:
+                if ex is None or ex.status in TERMINAL_STATUSES:
                     return
                 if ex.deadline_at and now_utc >= ex.deadline_at:
-                    ex.status = "expired"
-                    ex.finished_at = now_utc
-                    ex.result_summary = "已超过任务有效时间"
-                    publish_failure(session, ex, self.clock)
+                    self._expire_execution(session, ex, now_utc)
                     session.commit()
                     return
-                if ex.schedule_id:
-                    sched = session.get(TaskSchedule, ex.schedule_id)
-                    if sched and sched.status in {"paused", "cancelled"}:
-                        return
+                sched = (
+                    session.get(TaskSchedule, ex.schedule_id)
+                    if ex.schedule_id
+                    else None
+                )
+                if sched and sched.status in {"paused", "cancelled"}:
+                    return
                 ex.status = "running"
                 if ex.started_at is None:
                     ex.started_at = now_utc
-                task_type = ex.task_type
-                module = ex.module
-                schedule_id = ex.schedule_id
-                business_key = ex.business_key
-                deadline_at = ex.deadline_at
-                stage = ex.stage
-                retry_count = ex.retry_count
-                raw_params = {}
-                if schedule_id:
-                    sched = session.get(TaskSchedule, schedule_id)
-                    if sched:
-                        raw_params = dict(sched.parameters_json or {})
+                raw_params = dict(sched.parameters_json or {}) if sched else {}
+                ctx = TaskContext(
+                    execution_id=execution_id,
+                    schedule_id=ex.schedule_id,
+                    task_type=ex.task_type,
+                    module=ex.module,
+                    business_key=ex.business_key,
+                    deadline_at=ex.deadline_at,
+                    stage=ex.stage,
+                    retry_count=ex.retry_count,
+                    clock=self.clock,
+                    db_session_factory=self.session_factory,
+                )
                 session.commit()
 
-            lock = self.module_lock(module)
-            async with lock:
+            async with self.module_lock(ctx.module):
                 with self.session_factory() as session:
                     current = session.get(TaskExecution, execution_id)
-                    schedule = (
-                        session.get(TaskSchedule, schedule_id) if schedule_id else None
-                    )
-                    blocked = self._check_module_blocking(session, task_type, module)
                     if current is None or current.status == "cancelled":
                         return
+                    schedule = (
+                        session.get(TaskSchedule, ctx.schedule_id)
+                        if ctx.schedule_id
+                        else None
+                    )
+                    blocked = self._check_module_blocking(
+                        session, ctx.task_type, ctx.module
+                    )
                     if blocked or (
                         schedule and schedule.status in {"paused", "cancelled"}
                     ):
@@ -453,31 +398,16 @@ class UnifiedScheduler:
                         current.next_retry_at = current.resume_at = None
                         session.commit()
                         return
-                reg = self.registry.get(task_type)
-                validated_params = self.registry.validate_parameters(
-                    task_type, raw_params
-                )
-                ctx = TaskContext(
-                    execution_id=execution_id,
-                    schedule_id=schedule_id,
-                    task_type=task_type,
-                    module=module,
-                    business_key=business_key,
-                    deadline_at=deadline_at,
-                    stage=stage,
-                    retry_count=retry_count,
-                    clock=self.clock,
-                    db_session_factory=self.session_factory,
-                    cipher=self.cipher,
-                )
-                logger.debug("Executing task %s (%s)", execution_id, task_type)
+                reg = self.registry.get(ctx.task_type)
+                params = self.registry.validate_parameters(ctx.task_type, raw_params)
+                logger.debug("Executing task %s (%s)", execution_id, ctx.task_type)
                 try:
-                    result = await reg.handler(ctx, validated_params)
+                    result = await reg.handler(ctx, params)
                 except Exception as exc:
                     logger.exception(
                         "Task execution %s (%s) raised exception",
                         execution_id,
-                        task_type,
+                        ctx.task_type,
                     )
                     result = TaskResult(
                         status="failed",
@@ -485,11 +415,10 @@ class UnifiedScheduler:
                         error_message=str(exc),
                         retryable=True,
                     )
-
                 logger.debug(
                     "Task %s (%s): %s - %s",
                     execution_id,
-                    task_type,
+                    ctx.task_type,
                     result.status,
                     result.summary,
                 )
@@ -510,47 +439,29 @@ class UnifiedScheduler:
             if result.next_stage:
                 ex.stage = result.next_stage
             if result.stage_payload is not None:
-                stage_row = (
-                    session.query(TaskStage)
-                    .filter_by(execution_id=execution_id, stage_name=ex.stage)
-                    .first()
+                upsert_stage(
+                    session,
+                    execution_id,
+                    ex.stage,
+                    result.status,
+                    result.stage_payload,
+                    result.resume_at,
                 )
-                if stage_row is None:
-                    session.add(
-                        TaskStage(
-                            execution_id=execution_id,
-                            stage_name=ex.stage,
-                            status=result.status,
-                            payload_json=result.stage_payload,
-                            resume_at=result.resume_at,
-                        )
-                    )
-                else:
-                    stage_row.status = result.status
-                    stage_row.payload_json = result.stage_payload
-                    stage_row.resume_at = result.resume_at
 
             ex.result_summary = result.summary
-            merged_data = dict(ex.result_data_json or {})
-            merged_data.update(result.data or {})
-            ex.result_data_json = merged_data
+            ex.result_data_json = {**(ex.result_data_json or {}), **result.data}
 
             if result.status == "succeeded":
                 ex.status = "succeeded"
                 ex.finished_at = now_utc
-                ex.next_retry_at = None
-                ex.resume_at = None
-                ex.wait_reason = None
-                ex.error_message = None
-                if sched:
-                    sched.last_run_at = now_utc
-                    sched.last_result_status = "succeeded"
-                    sched.last_result_summary = result.summary
-                    if sched.trigger_type == "once" or (
-                        sched.trigger_type == "window" and result.complete_window
-                    ):
-                        sched.status = "completed"
-                        sched.next_run_at = None
+                ex.next_retry_at = ex.resume_at = None
+                ex.wait_reason = ex.error_message = None
+                if sched and (
+                    sched.trigger_type == "once"
+                    or (sched.trigger_type == "window" and result.complete_window)
+                ):
+                    sched.status = "completed"
+                    sched.next_run_at = None
 
             elif result.status == "waiting":
                 ex.status = "waiting"
@@ -558,12 +469,8 @@ class UnifiedScheduler:
                 ex.resume_at = (
                     ensure_utc(result.resume_at)
                     if result.resume_at
-                    else (now_utc + timedelta(seconds=30))
+                    else now_utc + timedelta(seconds=30)
                 )
-                if sched:
-                    sched.last_run_at = now_utc
-                    sched.last_result_status = "waiting"
-                    sched.last_result_summary = result.summary
 
             elif result.status == "pending_confirm":
                 ex.status = "pending_confirm"
@@ -571,43 +478,39 @@ class UnifiedScheduler:
                     result.wait_reason or "写操作超时或状态不明确，等待查询确认"
                 )
                 ex.next_retry_at = now_utc + timedelta(seconds=10)
-                if sched:
-                    sched.last_run_at = now_utc
-                    sched.last_result_status = "pending_confirm"
-                    sched.last_result_summary = result.summary
 
-            else:  # failed
+            else:
+                ex.error_message = result.error_message or result.summary
+                ex.next_retry_at = None
+                next_try = None
                 if result.retryable and ex.retry_count < len(QUERY_RETRY_DELAYS):
-                    delay = QUERY_RETRY_DELAYS[ex.retry_count]
-                    next_try = now_utc + timedelta(seconds=delay)
-                    if ex.deadline_at and next_try >= ex.deadline_at:
-                        ex.status = "expired"
-                        ex.finished_at = now_utc
-                        ex.error_message = result.error_message or result.summary
-                        ex.next_retry_at = None
-                    else:
-                        ex.retry_count += 1
-                        ex.status = "pending"
-                        ex.next_retry_at = next_try
-                        ex.error_message = result.error_message or result.summary
+                    next_try = now_utc + timedelta(
+                        seconds=QUERY_RETRY_DELAYS[ex.retry_count]
+                    )
+                if next_try and not (ex.deadline_at and next_try >= ex.deadline_at):
+                    ex.retry_count += 1
+                    ex.status = "pending"
+                    ex.next_retry_at = next_try
                 else:
-                    ex.status = "failed"
+                    # A retry that would land past the deadline expires instead of failing.
+                    ex.status = "expired" if next_try else "failed"
                     ex.finished_at = now_utc
-                    ex.error_message = result.error_message or result.summary
-                    ex.next_retry_at = None
-                    if sched and (
-                        sched.trigger_type == "once" or result.complete_window
+                    if (
+                        ex.status == "failed"
+                        and sched
+                        and (sched.trigger_type == "once" or result.complete_window)
                     ):
                         sched.status = "completed"
                         sched.next_run_at = None
-                if sched:
-                    sched.last_run_at = now_utc
-                    sched.last_result_status = ex.status
-                    sched.last_result_summary = result.summary
 
-            # Persist notification events in the SAME DB transaction
+            if sched:
+                sched.last_run_at = now_utc
+                sched.last_result_status = ex.status
+                sched.last_result_summary = result.summary
+
+            # Persist notification events in the same DB transaction.
             if ex.status in {"failed", "expired"}:
-                publish_failure(session, ex, self.clock)
+                self._publish_failure(session, ex)
             for ev in result.events:
                 publish_event(
                     session,

@@ -13,7 +13,6 @@ services:
     environment:
       TZ: Asia/Shanghai
       AUTOBUAA_DATA_DIR: /data
-      AUTOBUAA_PORT: 8080
       AUTOBUAA_LOG_LEVEL: ${AUTOBUAA_LOG_LEVEL:-DEBUG}
       AUTOBUAA_COOKIE_SECURE: ${AUTOBUAA_COOKIE_SECURE:-false}
     healthcheck:

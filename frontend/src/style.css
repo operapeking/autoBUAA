@@ -10,7 +10,7 @@
   --color-destructive: #b83b3b;
   --radius-sm: .375rem; --radius-md: .5rem; --radius-lg: .75rem; --radius-xl: 1rem;
 }
-:root { --background: #fafbf9; --foreground: #202823; --card: #fff; --primary: #285341; --text-muted: #707772; font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; color: var(--foreground); background: var(--background); font-synthesis: none; }
+:root { --background: #fafbf9; --foreground: #202823; --card: #fff; --primary: #285341; font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; color: var(--foreground); background: var(--background); font-synthesis: none; }
 @layer base { * { @apply border-border; } body { margin: 0; } button, input, select { font: inherit; } button { cursor: pointer; } button:disabled { cursor: default; } h1 { @apply text-3xl font-semibold tracking-tight; } }
 @layer components {
   .app-shell { @apply min-h-screen md:grid md:grid-cols-[224px_1fr]; }
@@ -21,7 +21,6 @@
   .sidebar-footer { @apply md:mt-auto flex items-center justify-between md:border-t md:pt-4; }
   .sidebar-footer > span { @apply hidden md:block; }
   .main-area { @apply p-5 sm:p-8 lg:px-12 lg:py-10 md:col-start-2 mx-auto w-full max-w-7xl; }
-  .eyebrow { @apply text-[10px] tracking-[0.22em] text-muted-foreground mb-3 font-semibold; }
   .field { @apply flex flex-col gap-2 text-sm; }
   .field select, .compact-input { @apply h-9 rounded-md border bg-white px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50; }
   .data-row { @apply flex justify-between items-center border-b last:border-b-0 py-4; }

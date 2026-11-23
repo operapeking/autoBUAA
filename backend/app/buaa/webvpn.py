@@ -2,13 +2,9 @@
 # Sangfor SSL WebVPN (vpn.buaa.edu.cn).
 from __future__ import annotations
 
-import ipaddress
 import re
-import socket
-from dataclasses import dataclass
 from urllib.parse import urlparse
 
-import httpx
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
 try:
@@ -22,7 +18,6 @@ WEBVPN_KEY = b"wrdvpnisthebest!"
 SANGFOR_VPN_GATEWAY = "https://vpn.buaa.edu.cn"
 SANGFOR_VPN_HOST = "vpn.buaa.edu.cn"
 SANGFOR_VPN_SUFFIX = ".vpn.buaa.edu.cn"
-GATEWAY_HOST = "gw.buaa.edu.cn"
 
 _SANGFOR_WEB_PATH_RE = re.compile(
     r"^/(?:safeurl/)?web/\d+/(https?)/\d+/([^/?#]+)(.*)$", re.IGNORECASE
@@ -169,148 +164,3 @@ def route_url(url: str, network_mode: str) -> str:
     if network_mode == "vpn_buaa":
         return to_sangfor_webvpn_url(url)
     return url
-
-
-@dataclass
-class EndpointDiagnostic:
-    target_host: str
-    target_port: int
-    network_mode: str
-    dns_ok: bool
-    resolved_ips: list[str]
-    connect_ok: bool
-    http_status: int | None
-    failed_step: str | None
-    message: str
-
-
-def diagnose_host_connection(
-    target_url: str,
-    network_mode: str,
-    *,
-    timeout_seconds: float = 4.0,
-    transport: httpx.BaseTransport | None = None,
-) -> EndpointDiagnostic:
-    effective_url = route_url(target_url, network_mode)
-    parsed = urlparse(effective_url)
-    host = parsed.hostname or ""
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-
-    if transport is not None:
-        try:
-            with httpx.Client(
-                timeout=timeout_seconds, transport=transport, follow_redirects=False
-            ) as client:
-                resp = client.get(effective_url)
-            return EndpointDiagnostic(
-                target_host=host,
-                target_port=port,
-                network_mode=network_mode,
-                dns_ok=True,
-                resolved_ips=["mock"],
-                connect_ok=True,
-                http_status=resp.status_code,
-                failed_step=None,
-                message="连接正常",
-            )
-        except Exception as exc:
-            return EndpointDiagnostic(
-                target_host=host,
-                target_port=port,
-                network_mode=network_mode,
-                dns_ok=True,
-                resolved_ips=["mock"],
-                connect_ok=False,
-                http_status=None,
-                failed_step="connect",
-                message=f"连接失败: {exc}",
-            )
-
-    try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        ips = sorted({info[4][0] for info in infos})
-    except OSError as exc:
-        return EndpointDiagnostic(
-            target_host=host,
-            target_port=port,
-            network_mode=network_mode,
-            dns_ok=False,
-            resolved_ips=[],
-            connect_ok=False,
-            http_status=None,
-            failed_step="dns",
-            message=f"DNS 解析失败 ({host}): {exc}",
-        )
-
-    connected = False
-    last_err: str = ""
-    for ip in ips[:3]:
-        try:
-            with socket.create_connection((ip, port), timeout=timeout_seconds):
-                connected = True
-                break
-        except OSError as exc:
-            last_err = str(exc)
-
-    if not connected:
-        return EndpointDiagnostic(
-            target_host=host,
-            target_port=port,
-            network_mode=network_mode,
-            dns_ok=True,
-            resolved_ips=ips,
-            connect_ok=False,
-            http_status=None,
-            failed_step="connect",
-            message=f"TCP 连接失败 ({host}:{port}): {last_err}",
-        )
-
-    try:
-        with httpx.Client(timeout=timeout_seconds, follow_redirects=False) as client:
-            resp = client.get(effective_url)
-        return EndpointDiagnostic(
-            target_host=host,
-            target_port=port,
-            network_mode=network_mode,
-            dns_ok=True,
-            resolved_ips=ips,
-            connect_ok=True,
-            http_status=resp.status_code,
-            failed_step=None,
-            message=f"连接正常 (HTTP {resp.status_code})",
-        )
-    except Exception as exc:
-        return EndpointDiagnostic(
-            target_host=host,
-            target_port=port,
-            network_mode=network_mode,
-            dns_ok=True,
-            resolved_ips=ips,
-            connect_ok=False,
-            http_status=None,
-            failed_step="http",
-            message=f"HTTP/TLS 请求失败: {exc}",
-        )
-
-
-def detect_campus_gateway(timeout_seconds: float = 2.0) -> bool:
-    """Detect whether gw.buaa.edu.cn resolves to 10.0.0.0/8 and accepts TCP:80."""
-    try:
-        infos = socket.getaddrinfo(
-            GATEWAY_HOST, 80, family=socket.AF_INET, type=socket.SOCK_STREAM
-        )
-    except OSError:
-        return False
-    for info in infos:
-        ip_str = info[4][0]
-        try:
-            ip = ipaddress.IPv4Address(ip_str)
-        except ValueError:
-            continue
-        if ip.packed[0] == 10:
-            try:
-                with socket.create_connection((ip_str, 80), timeout=timeout_seconds):
-                    return True
-            except OSError:
-                continue
-    return False

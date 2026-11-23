@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue';
-import { api, taskNames, notificationStatusNames, type ScheduleItem, type ExecutionItem, type NotificationEvent } from '@/api/client';
+import { api, type ScheduleItem, type ExecutionItem, type NotificationEvent } from '@/api/client';
+import { taskNames, notificationStatusNames } from '@/lib/format';
 import { useLive } from '@/composables/useLive';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';

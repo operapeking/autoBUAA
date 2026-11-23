@@ -8,7 +8,7 @@ import secrets
 import xml.etree.ElementTree as ET
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urljoin
 
 import httpx
@@ -257,6 +257,12 @@ class BuaaSessionManager:
                 session.delete(row)
                 session.commit()
 
+    def clear_all_states(self) -> None:
+        """Drop every cached SSO/WebVPN/business session, e.g. after credentials change."""
+        with self.session_factory() as session:
+            session.query(SessionState).delete()
+            session.commit()
+
     def build_http_client(
         self, network_mode: str, follow_redirects: bool = False
     ) -> httpx.AsyncClient:
@@ -290,22 +296,12 @@ class BuaaSessionManager:
         rsa_key: str,
         rsa_exp: str,
         error_msg: str | None = None,
-    ) -> None:
+    ) -> NoReturn:
         img_resp = await client.get(
             f"{SANGFOR_RAND_CODE_URL}?rnd={secrets.token_hex(4)}"
         )
-        img_resp.raise_for_status()
-        ct = img_resp.headers.get("content-type", "image/gif")
-        if "png" in ct.lower():
-            ext = ".png"
-        elif "gif" in ct.lower():
-            ext = ".gif"
-        else:
-            ext = ".jpg"
         captcha_id = f"vpn-{secrets.token_hex(6)}"
-        self.captcha_dir.mkdir(parents=True, exist_ok=True)
-        img_path = self.captcha_dir / f"{captcha_id}{ext}"
-        img_path.write_bytes(img_resp.content)
+        img_path = self._save_captcha_image(captcha_id, img_resp)
 
         twfid = client.cookies.get("TWFID") or ""
         if twfid:
@@ -319,20 +315,49 @@ class BuaaSessionManager:
                 "rsa_exp": rsa_exp,
             },
         )
-        challenge = CaptchaChallenge(
-            captcha_id=captcha_id,
-            captcha_type="sangfor_vpn",
-            execution=csrf_rand_code,
-            image_path=img_path,
-            image_bytes=img_resp.content,
-            mime_type=ct,
+        message = error_msg or "vpn.buaa.edu.cn 需要输入验证码"
+        challenge = CaptchaChallenge(captcha_id, "sangfor_vpn", img_path)
+        self._mark_captcha_required(challenge, error_msg=message)
+        raise CaptchaRequiredError(challenge, message)
+
+    async def _raise_sso_captcha(
+        self,
+        client: httpx.AsyncClient,
+        network_mode: str,
+        page_html: str,
+        captcha: tuple[str, str],
+        *,
+        error_msg: str | None = None,
+        message: str = "登录需要输入图形验证码",
+    ) -> NoReturn:
+        """Persist the challenge-issuing page so a typed code can be submitted against it."""
+        captcha_type, captcha_id = captcha
+        img_resp = await client.get(
+            route_url(f"{SSO_CAPTCHA_URL}?captchaId={captcha_id}", network_mode)
         )
-        self._mark_captcha_required(
-            challenge, error_msg=error_msg or "vpn.buaa.edu.cn 需要输入验证码"
+        img_path = self._save_captcha_image(captcha_id, img_resp)
+        self.save_http_cookies(network_mode, client)
+        self.save_domain_state(
+            f"sso_pending:{network_mode}", {"html": page_html, "captcha_id": captcha_id}
         )
-        raise CaptchaRequiredError(
-            challenge, error_msg or "vpn.buaa.edu.cn 需要输入验证码"
+        challenge = CaptchaChallenge(captcha_id, captcha_type, img_path)
+        self._mark_captcha_required(challenge, error_msg=error_msg)
+        raise CaptchaRequiredError(challenge, error_msg or message)
+
+    def _save_captcha_image(self, captcha_id: str, response: httpx.Response) -> Path:
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").lower()
+        ext = (
+            ".png"
+            if "png" in content_type
+            else ".gif"
+            if "gif" in content_type
+            else ".jpg"
         )
+        self.captcha_dir.mkdir(parents=True, exist_ok=True)
+        path = self.captcha_dir / f"{captcha_id}{ext}"
+        path.write_bytes(response.content)
+        return path
 
     async def _ensure_sangfor_vpn_login(
         self,
@@ -492,9 +517,7 @@ class BuaaSessionManager:
             if sso_captcha_code:
                 # Resume the challenge-issuing login page: a fresh GET /login
                 # would issue a new captchaId and invalidate the typed code.
-                html = str(
-                    self.load_domain_state(pending_key).get("html") or ""
-                )
+                html = str(self.load_domain_state(pending_key).get("html") or "")
             if not html:
                 get_resp = await client.get(login_url)
                 if (
@@ -530,9 +553,7 @@ class BuaaSessionManager:
                     ) and not is_vpn_gateway_url(str(followed.url)):
                         self.clear_domain_state(pending_key)
                         self.save_http_cookies(network_mode, client)
-                        info = await self._activate_and_userinfo(
-                            client, network_mode
-                        )
+                        info = await self._activate_and_userinfo(client, network_mode)
                         self._mark_login_success(info.get("name"))
                         return info
 
@@ -540,34 +561,7 @@ class BuaaSessionManager:
                 # A code reaching this branch has no stored challenge page to
                 # resume, so it cannot match this fresh captchaId; re-issue.
                 if captcha:
-                    captcha_type, captcha_id = captcha
-                    execution = extract_execution(html)
-                    img_resp = await client.get(
-                        route_url(
-                            f"{SSO_CAPTCHA_URL}?captchaId={captcha_id}", network_mode
-                        )
-                    )
-                    img_resp.raise_for_status()
-                    ct = img_resp.headers.get("content-type", "image/jpeg")
-                    ext = ".png" if "png" in ct.lower() else ".jpg"
-                    self.captcha_dir.mkdir(parents=True, exist_ok=True)
-                    img_path = self.captcha_dir / f"{captcha_id}{ext}"
-                    img_path.write_bytes(img_resp.content)
-                    self.save_http_cookies(network_mode, client)
-                    self.save_domain_state(
-                        pending_key, {"html": html, "captcha_id": captcha_id}
-                    )
-
-                    challenge = CaptchaChallenge(
-                        captcha_id=captcha_id,
-                        captcha_type=captcha_type,
-                        execution=execution,
-                        image_path=img_path,
-                        image_bytes=img_resp.content,
-                        mime_type=ct,
-                    )
-                    self._mark_captcha_required(challenge)
-                    raise CaptchaRequiredError(challenge)
+                    await self._raise_sso_captcha(client, network_mode, html, captcha)
 
             params = build_login_params(html, student_id, password, sso_captcha_code)
             post_resp = await client.post(
@@ -578,33 +572,15 @@ class BuaaSessionManager:
             final = await self._follow_redirects_and_password_expiry(client, post_resp)
             err = find_login_error(final.text)
             if final.status_code >= 400 or err:
-                # Check if server returned a new captcha challenge
                 next_captcha = detect_captcha(final.text)
                 if next_captcha:
-                    captcha_type, captcha_id = next_captcha
-                    img_resp = await client.get(
-                        route_url(
-                            f"{SSO_CAPTCHA_URL}?captchaId={captcha_id}", network_mode
-                        )
-                    )
-                    img_path = self.captcha_dir / f"{captcha_id}.jpg"
-                    if img_resp.status_code == 200:
-                        self.captcha_dir.mkdir(parents=True, exist_ok=True)
-                        img_path.write_bytes(img_resp.content)
-                    self.save_http_cookies(network_mode, client)
-                    self.save_domain_state(
-                        pending_key,
-                        {"html": final.text, "captcha_id": captcha_id},
-                    )
-                    challenge = CaptchaChallenge(
-                        captcha_id=captcha_id,
-                        captcha_type=captcha_type,
-                        execution=extract_execution(final.text),
-                        image_path=img_path,
-                    )
-                    self._mark_captcha_required(challenge, error_msg=err)
-                    raise CaptchaRequiredError(
-                        challenge, err or "验证码校验未通过，请重新输入"
+                    await self._raise_sso_captcha(
+                        client,
+                        network_mode,
+                        final.text,
+                        next_captcha,
+                        error_msg=err,
+                        message="验证码校验未通过，请重新输入",
                     )
                 self.clear_domain_state(pending_key)
                 reason = (
@@ -679,10 +655,7 @@ class BuaaSessionManager:
                 account.auth_status = "captcha_required"
                 account.captcha_id = challenge.captcha_id
                 account.captcha_type = challenge.captcha_type
-                account.captcha_execution = challenge.execution
-                account.captcha_image_path = (
-                    str(challenge.image_path) if challenge.image_path else None
-                )
+                account.captcha_image_path = str(challenge.image_path)
                 account.auth_error = reason or "统一认证需要输入验证码"
             latest = (
                 session.query(NotificationEvent)
@@ -732,7 +705,6 @@ class BuaaSessionManager:
                 account.auth_error = None
                 account.captcha_id = None
                 account.captcha_type = None
-                account.captcha_execution = None
                 account.captcha_image_path = None
                 account.last_login_at = now_utc
                 if display_name:

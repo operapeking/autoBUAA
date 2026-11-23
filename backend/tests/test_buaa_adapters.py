@@ -28,7 +28,7 @@ from app.buaa.webvpn import (
 from app.buaa.ygdk import YgdkClient
 from app.container import AppContainer
 from app.core.config import Settings
-from app.core.network import apply_unified_network_mode
+from app.core.network import set_network_mode
 from app.core.time import SHANGHAI_TZ, UTC_TZ, Clock
 from app.db.models import (
     BoyaCourseCache,
@@ -356,7 +356,7 @@ async def test_classroom_timeout_enters_pending_confirm_and_recovers(
         mod = session.get(ModuleConfig, "classroom")
         assert mod is not None
         mod.enabled = True
-        apply_unified_network_mode(session, network_mode="direct")
+        set_network_mode(session, "direct")
         session.commit()
 
     await sync_classroom_today(
@@ -637,7 +637,7 @@ async def test_boya_sync_schedules_sign_windows_and_reminders(tmp_path: Path) ->
         mod = session.get(ModuleConfig, "boya")
         assert mod is not None
         mod.enabled = True
-        apply_unified_network_mode(session, network_mode="direct")
+        set_network_mode(session, "direct")
         session.commit()
 
     await sync_boya_all(
@@ -733,7 +733,7 @@ async def test_classroom_signin_offset_and_window_bounds(tmp_path: Path) -> None
         assert mod is not None
         mod.enabled = True
         assert mod.config_json["signin_offset_minutes"] == -5
-        apply_unified_network_mode(session, network_mode="direct")
+        set_network_mode(session, "direct")
         session.commit()
 
     # 1. Default -5 -> [09:55:00, 10:30:00]
@@ -1046,7 +1046,7 @@ async def test_sangfor_vpn_buaa_auth_and_business_routing(tmp_path: Path) -> Non
         assert acc is not None
         acc.student_id = "23000001"
         acc.encrypted_password = container.cipher.encrypt("pw123456")
-        apply_unified_network_mode(session, network_mode="vpn_buaa")
+        set_network_mode(session, "vpn_buaa")
         session.commit()
 
     # Step 1: Sangfor VPN triggers captcha challenge
@@ -1268,7 +1268,7 @@ async def test_boya_preview_course_scheduled_5_minutes_before_select_start(
         assert ch is not None
         ch.enabled = True
         ch.encrypted_device_key = container.cipher.encrypt("bark-key-123")
-        apply_unified_network_mode(session, network_mode="direct")
+        set_network_mode(session, "direct")
         rule = (
             session.query(NotificationRule)
             .filter_by(event_type="signup_reminder", module="boya")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
 from app.core.crypto import SecretCipher
@@ -32,9 +32,14 @@ SENSITIVE_PAYLOAD_KEYS = {
     "sessionid",
     "cookies",
     "cookie",
-    "photo_bytes",
-    "image_bytes",
     "secret",
+}
+
+REMINDER_EVENTS = {
+    "signup_reminder",
+    "signin_reminder",
+    "signout_reminder",
+    "exercise_reminder",
 }
 
 EVENT_TITLES: dict[str, str] = {
@@ -51,7 +56,7 @@ EVENT_TITLES: dict[str, str] = {
 
 
 def sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Strip sensitive keys (passwords, tokens, Bark keys, photo blobs) from payloads."""
+    """Strip sensitive keys (passwords, tokens, Bark keys, raw bytes) from payloads."""
     cleaned: dict[str, Any] = {}
     for k, v in (payload or {}).items():
         if k.lower() in SENSITIVE_PAYLOAD_KEYS:
@@ -89,6 +94,12 @@ def render_notification_text(
             parts.append(f"原因: {payload['reason']}")
         body = "\n".join(parts)
     return title[:250], body
+
+
+def expire_events(events: Iterable[NotificationEvent]) -> None:
+    for event in events:
+        event.status = "expired"
+        event.next_retry_at = None
 
 
 def match_rule(

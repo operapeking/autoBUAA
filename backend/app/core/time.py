@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -25,12 +25,8 @@ class Clock:
         self._fixed_utc = ensure_utc(dt)
 
     def advance(self, seconds: float) -> datetime:
-        from datetime import timedelta
-
-        current = self.now_utc()
-        updated = current + timedelta(seconds=seconds)
-        self._fixed_utc = updated
-        return updated
+        self._fixed_utc = self.now_utc() + timedelta(seconds=seconds)
+        return self._fixed_utc
 
 
 default_clock = Clock()

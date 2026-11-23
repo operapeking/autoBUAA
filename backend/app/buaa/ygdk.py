@@ -8,11 +8,9 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
-from .exceptions import BuaaError, SessionExpiredError
+from .exceptions import BuaaError, SessionExpiredError, parse_int
 from .sso import BuaaSessionManager, looks_like_login_page
 from .webvpn import (
-    EndpointDiagnostic,
-    diagnose_host_connection,
     from_webvpn_url,
     is_vpn_gateway_url,
     route_url,
@@ -39,16 +37,6 @@ class YgdkOverviewData:
     week_target: int | None
 
 
-def _parse_int(val: Any) -> int | None:
-    if isinstance(val, bool) or val is None:
-        return None
-    if isinstance(val, int):
-        return val
-    if isinstance(val, str) and val.strip().lstrip("-").isdigit():
-        return int(val.strip())
-    return None
-
-
 def _extract_code_from_url(raw_url: str) -> str | None:
     try:
         direct = from_webvpn_url(raw_url)
@@ -70,7 +58,7 @@ def _extract_code_from_url(raw_url: str) -> str | None:
 
 
 def _parse_envelope(payload: dict[str, Any]) -> Any:
-    code = _parse_int(payload.get("code"))
+    code = parse_int(payload.get("code"))
     if code == 1:
         return payload.get("result")
     if code == -98:
@@ -92,9 +80,6 @@ class YgdkClient:
     @property
     def _state_key(self) -> str:
         return f"ygdk:{self.network_mode}"
-
-    def diagnose(self) -> EndpointDiagnostic:
-        return diagnose_host_connection(f"{YGDK_FRONT_BASE}/", self.network_mode)
 
     async def _ensure_credential(self, force_refresh: bool = False) -> tuple[int, str]:
         if not force_refresh:
@@ -134,7 +119,7 @@ class YgdkClient:
             )
             if not isinstance(data, dict):
                 raise BuaaError("阳光打卡登录响应结构无效")
-            uid = _parse_int(data.get("uid"))
+            uid = parse_int(data.get("uid"))
             token = str(data.get("token") or "").strip()
             if not uid or not token:
                 raise BuaaError("阳光打卡登录响应缺少 uid 或 token")
@@ -189,7 +174,6 @@ class YgdkClient:
         path: str,
         params: dict[str, Any] | None = None,
         *,
-        duplicate_query: bool = False,
         include_user_id: bool = False,
     ) -> Any:
         sso_refreshed = False
@@ -203,13 +187,11 @@ class YgdkClient:
                 sso_refreshed = True
                 uid, token = await self._ensure_credential(force_refresh=True)
 
-            base_params = {k: str(v) for k, v in (params or {}).items()}
+            form = {k: str(v) for k, v in (params or {}).items()}
             if include_user_id:
-                base_params["user_id"] = str(uid)
-            form: dict[str, str] = dict(base_params)
+                form["user_id"] = str(uid)
             form["uid"] = str(uid)
             form["token"] = token
-            query_params = dict(base_params) if duplicate_query else None
             url = route_url(f"{YGDK_FRONT_BASE}{path}", self.network_mode)
 
             async with self.session_mgr.build_http_client(
@@ -218,7 +200,6 @@ class YgdkClient:
                 try:
                     resp = await client.post(
                         url,
-                        params=query_params,
                         data=form,
                         headers={
                             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -259,7 +240,7 @@ class YgdkClient:
             (r for r in classify_rows if "体育" in str(r.get("name") or "")),
             classify_rows[0] if classify_rows else None,
         )
-        if not selected or not _parse_int(selected.get("classify_id")):
+        if not selected or not parse_int(selected.get("classify_id")):
             raise BuaaError("未获取到阳光打卡分类")
         classify_id = int(selected["classify_id"])
         classify_name = str(selected.get("name") or "")
@@ -282,19 +263,19 @@ class YgdkClient:
                     "term_count_show",
                     "term_count",
                 )
-                if (value := _parse_int(count.get(key))) is not None
+                if (value := parse_int(count.get(key))) is not None
             ),
             None,
         )
         return YgdkOverviewData(
             classify_id=classify_id,
             classify_name=classify_name,
-            term_id=_parse_int(term.get("term_id")) or _parse_int(term.get("id")),
+            term_id=parse_int(term.get("term_id")) or parse_int(term.get("id")),
             term_name=term.get("name"),
             term_count=term_count,
-            term_target=_parse_int(count.get("term_num"))
-            or _parse_int(selected.get("term_num")),
-            week_count=_parse_int(count.get("week_count")),
-            week_target=_parse_int(count.get("week_num"))
-            or _parse_int(selected.get("week_num")),
+            term_target=parse_int(count.get("term_num"))
+            or parse_int(selected.get("term_num")),
+            week_count=parse_int(count.get("week_count")),
+            week_target=parse_int(count.get("week_num"))
+            or parse_int(selected.get("week_num")),
         )

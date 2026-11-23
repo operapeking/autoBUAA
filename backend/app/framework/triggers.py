@@ -119,7 +119,6 @@ def compute_next_run(
     """Compute next scheduled UTC execution >= (or >) after_utc."""
     spec = validate_trigger(trigger_type, config)
     after = ensure_utc(after_utc)
-    anchor = after
 
     if trigger_type == "once":
         run_at = _parse_shanghai_dt(spec.run_at, "run_at")
@@ -127,17 +126,11 @@ def compute_next_run(
         exp = _parse_shanghai_dt(spec.expires_at, "expires_at") or (
             run_at + timedelta(minutes=5)
         )
-        if after >= exp:
-            return None
-        if inclusive and after <= run_at:
-            return run_at
-        if inclusive and run_at < after < exp:
-            return run_at
-        return None
+        return run_at if inclusive and after < exp else None
 
     if trigger_type == "daily":
         tod = _parse_time_of_day(spec.time_of_day, "time")
-        sh_anchor = anchor.astimezone(SHANGHAI_TZ)
+        sh_anchor = after.astimezone(SHANGHAI_TZ)
         candidate_date = sh_anchor.date()
         candidate_sh = datetime.combine(candidate_date, tod, tzinfo=SHANGHAI_TZ)
         cmp_ok = candidate_sh >= sh_anchor if inclusive else candidate_sh > sh_anchor
@@ -152,31 +145,29 @@ def compute_next_run(
         if spec.start_at:
             base = _parse_shanghai_dt(spec.start_at, "start_at")
             assert base is not None
-            if anchor <= base:
+            if after <= base:
                 candidate = base
             else:
-                elapsed = (anchor - base).total_seconds()
+                elapsed = (after - base).total_seconds()
                 steps = int(elapsed // interval.total_seconds())
                 candidate = base + interval * steps
-                if (candidate < anchor) or (not inclusive and candidate <= anchor):
+                if (candidate < after) or (not inclusive and candidate <= after):
                     candidate += interval
         else:
-            candidate = anchor if inclusive else (anchor + interval)
+            candidate = after if inclusive else (after + interval)
         return candidate
 
     if trigger_type == "window":
         start_at = _parse_shanghai_dt(spec.start_at, "start_at")
         end_at = _parse_shanghai_dt(spec.end_at, "end_at")
         assert start_at is not None and end_at is not None
-        first_run = start_at
         if after >= end_at:
             return None
-        if after < first_run or (inclusive and after == first_run):
-            return first_run
+        if after < start_at or (inclusive and after == start_at):
+            return start_at
         step = spec.poll_interval_seconds
-        elapsed = (after - first_run).total_seconds()
-        n = int(elapsed // step)
-        candidate = first_run + timedelta(seconds=n * step)
+        elapsed = (after - start_at).total_seconds()
+        candidate = start_at + timedelta(seconds=int(elapsed // step) * step)
         if (candidate < after) or (not inclusive and candidate <= after):
             candidate += timedelta(seconds=step)
         if candidate >= end_at:

@@ -156,7 +156,7 @@ async def test_cache_api_failure_and_account_change(container, monkeypatch):
 def test_td_configuration_controls_hourly_schedule(container):
     client = TestClient(create_app(container, start_scheduler=False))
     client.post("/api/v1/auth/setup", json={"password": "admin-secret"})
-    path = "/api/v1/network/modules/td"
+    path = "/api/v1/modules/td"
     assert (
         client.put(
             path, json={"enabled": True, "config_json": {"term_target": 40}}

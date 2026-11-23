@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -18,8 +18,8 @@ from app.buaa.exceptions import BuaaError
 from app.buaa.sso import BuaaSessionManager
 from app.buaa.td import TdClient, TdOverviewData
 from app.buaa.ygdk import YgdkClient, YgdkOverviewData
-from app.core.network import get_unified_network_mode
-from app.core.time import SHANGHAI_TZ, UTC_TZ, Clock, default_clock
+from app.core.network import get_network_mode, read_network_mode
+from app.core.time import SHANGHAI_TZ, UTC_TZ, Clock
 from app.db.models import (
     BoyaCourseCache,
     BusinessCacheSnapshot,
@@ -28,167 +28,201 @@ from app.db.models import (
     ModuleConfig,
     NotificationEvent,
     NotificationRule,
-    TaskExecution,
     TaskSchedule,
 )
-from app.framework.tasks import TaskRegistry, create_schedule
+from app.framework.tasks import TaskRegistry, cancel_schedule, create_schedule
+from app.modules.automation import RESERVATION_TASK
 from app.notifications.service import (
-    publish_event as _publish_event,
-)
-from app.notifications.service import (
+    expire_events,
+    publish_event,
     render_notification_text,
 )
 from sqlalchemy.orm import Session
 
+WINDOW_POLL_SECONDS = 30
+COURSE_REMINDERS = {"signup_reminder", "signin_reminder", "signout_reminder"}
 
-def publish_event(session: Session, **kwargs: Any) -> Any:
-    session.info.setdefault("course_event_keys", set()).add(kwargs["event_key"])
-    existing = (
-        session.query(NotificationEvent)
-        .filter_by(event_key=kwargs["event_key"])
-        .first()
-    )
-    if (
-        existing
-        and existing.attempts == 0
-        and existing.status in {"pending", "expired"}
-    ):
-        clk = kwargs.get("clock") or default_clock
-        send_at = max(clk.now_utc(), kwargs.get("send_at") or clk.now_utc())
-        expires_at = kwargs.get("expires_at")
-        if expires_at and expires_at > send_at:
+
+def format_window_time(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+class CourseRefresh:
+    """Tracks the course windows and reminders one refresh still wants.
+
+    `finish()` cancels this module's windows and course reminders that the refresh no
+    longer produced, so cancelled or rescheduled courses do not leave stale work behind.
+    """
+
+    def __init__(
+        self, session: Session, registry: TaskRegistry, module: str, clock: Clock
+    ) -> None:
+        self.session = session
+        self.registry = registry
+        self.module = module
+        self.clock = clock
+        self._window_keys: set[str] = set()
+        self._reminder_keys: set[str] = set()
+
+    def remind(
+        self,
+        *,
+        event_type: str,
+        event_key: str,
+        payload: dict[str, Any],
+        send_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        """Publish a reminder, reviving an unsent one whose course time moved."""
+        self._reminder_keys.add(event_key)
+        existing = (
+            self.session.query(NotificationEvent).filter_by(event_key=event_key).first()
+        )
+        if existing is None:
+            publish_event(
+                self.session,
+                event_type=event_type,
+                event_key=event_key,
+                module=self.module,
+                payload=payload,
+                send_at=send_at,
+                expires_at=expires_at,
+                clock=self.clock,
+            )
+            return
+        if existing.attempts or existing.status not in {"pending", "expired"}:
+            return
+        send_at = max(self.clock.now_utc(), send_at)
+        if expires_at > send_at:
             existing.status = "pending"
             existing.next_retry_at = send_at
             existing.expires_at = expires_at
             existing.title, existing.body = render_notification_text(
-                kwargs["event_type"], kwargs["module"], kwargs["payload"]
+                event_type, self.module, payload
             )
-            existing.payload_json = kwargs["payload"]
-        return existing
-    return _publish_event(session, **kwargs)
+            existing.payload_json = payload
+
+    def plan_window(
+        self,
+        *,
+        name: str,
+        task_type: str,
+        business_key: str,
+        parameters: dict[str, Any],
+        start: datetime,
+        end: datetime,
+    ) -> None:
+        self._window_keys.add(business_key)
+        create_schedule(
+            self.session,
+            self.registry,
+            name=name,
+            task_type=task_type,
+            parameters=parameters,
+            trigger_type="window",
+            trigger_config={
+                "start_at": format_window_time(start),
+                "end_at": format_window_time(end),
+                "poll_interval_seconds": WINDOW_POLL_SECONDS,
+            },
+            business_key=business_key,
+            clock=self.clock,
+        )
+
+    def window_completed(self, business_key: str, end: datetime) -> bool:
+        """Whether the window ending at `end` already succeeded (the action is done)."""
+        schedule = (
+            self.session.query(TaskSchedule)
+            .filter_by(
+                business_key=business_key,
+                status="completed",
+                last_result_status="succeeded",
+            )
+            .first()
+        )
+        return bool(
+            schedule
+            and schedule.trigger_config_json.get("end_at") == format_window_time(end)
+        )
+
+    def finish(self) -> None:
+        now = self.clock.now_utc()
+        for sched in self.session.query(TaskSchedule).filter_by(
+            module=self.module, trigger_type="window", status="enabled"
+        ):
+            if (
+                sched.task_type != RESERVATION_TASK
+                and sched.business_key not in self._window_keys
+            ):
+                cancel_schedule(self.session, sched, now)
+        expire_events(
+            event
+            for event in self.session.query(NotificationEvent).filter_by(
+                module=self.module, status="pending"
+            )
+            if event.event_type in COURSE_REMINDERS
+            and event.event_key not in self._reminder_keys
+        )
 
 
-def plan_course_schedule(
-    session: Session, registry: TaskRegistry, **kwargs: Any
-) -> TaskSchedule:
-    session.info.setdefault("course_schedule_keys", set()).add(kwargs["business_key"])
-    return create_schedule(session, registry, **kwargs)
+def save_snapshot(
+    session: Session, key: str, payload: dict[str, Any], now_utc: datetime
+) -> None:
+    snapshot = session.get(BusinessCacheSnapshot, key)
+    if snapshot is None:
+        session.add(
+            BusinessCacheSnapshot(key=key, payload_json=payload, synced_at=now_utc)
+        )
+    else:
+        snapshot.payload_json = payload
+        snapshot.synced_at = now_utc
 
 
-def course_window_completed(session: Session, key: str, end: datetime) -> bool:
-    schedule = (
-        session.query(TaskSchedule)
-        .filter_by(business_key=key, status="completed", last_result_status="succeeded")
+def set_module_health(
+    session: Session, module: str, now_utc: datetime, error: str | None = None
+) -> None:
+    mod = session.get(ModuleConfig, module)
+    if mod is not None:
+        mod.health_status = "error" if error else "healthy"
+        mod.last_error = error
+        mod.last_checked_at = now_utc
+
+
+def mark_module_error(
+    session_factory: Any, module: str, error: str, clock: Clock
+) -> None:
+    with session_factory() as session:
+        set_module_health(session, module, clock.now_utc(), error)
+        session.commit()
+
+
+def _reminder_advance(
+    session: Session, event_type: str, module: str, default: int
+) -> timedelta:
+    rule = (
+        session.query(NotificationRule)
+        .filter_by(event_type=event_type, module=module)
         .first()
     )
-    return bool(
-        schedule
-        and schedule.trigger_config_json.get("end_at")
-        == end.strftime("%Y-%m-%d %H:%M:%S")
-    )
-
-
-def finish_course_refresh(
-    session: Session, module: str, *, auto_schedule: bool
-) -> None:
-    if auto_schedule:
-        keys = session.info.get("course_schedule_keys", set())
-        for sched in (
-            session.query(TaskSchedule)
-            .filter_by(module=module, trigger_type="window", status="enabled")
-            .all()
-        ):
-            if sched.task_type == "boya.auto_select":
-                continue
-            if sched.business_key not in keys:
-                sched.status = "cancelled"
-                sched.next_run_at = None
-                for execution in (
-                    session.query(TaskExecution)
-                    .filter(
-                        TaskExecution.schedule_id == sched.id,
-                        TaskExecution.status.in_(
-                            ["pending", "waiting", "pending_confirm"]
-                        ),
-                    )
-                    .all()
-                ):
-                    execution.status = "cancelled"
-                    execution.next_retry_at = execution.resume_at = None
-    event_keys = session.info.get("course_event_keys", set())
-    for event in (
-        session.query(NotificationEvent)
-        .filter_by(module=module, status="pending")
-        .all()
-    ):
-        if (
-            event.event_type
-            in {"signup_reminder", "signin_reminder", "signout_reminder"}
-            and event.event_key not in event_keys
-        ):
-            event.status = "expired"
-            event.next_retry_at = None
-
-
-def _get_module_config(session: Session, module: str) -> ModuleConfig:
-    cfg = session.get(ModuleConfig, module)
-    if cfg is None:
-        cfg = ModuleConfig(
-            module=module, enabled=False, network_mode="webvpn", config_json={}
-        )
-        session.add(cfg)
-        session.flush()
-    return cfg
-
-
-def resolve_classroom_offset_minutes(cfg_json: dict[str, Any]) -> int:
-    """Resolve classroom sign-in offset minutes relative to class begin (negative = before class)."""
-    if cfg_json.get("signin_offset_minutes") is not None:
-        return int(cfg_json["signin_offset_minutes"])
-    if cfg_json.get("offset_minutes") is not None:
-        return int(cfg_json["offset_minutes"])
-    if cfg_json.get("advance_minutes") is not None:
-        legacy = int(cfg_json["advance_minutes"])
-        return legacy if legacy <= 0 else -legacy
-    return -5
+    return timedelta(minutes=max(0, rule.advance_minutes) if rule else default)
 
 
 def classroom_signin_bounds(
     begin_sh: datetime, end_sh: datetime
 ) -> tuple[datetime, datetime]:
     """Hard sign-in bounds: [begin - 5m, min(begin + 30m, end)], per iClass server window."""
-    earliest_sh = begin_sh - timedelta(minutes=5)
-    latest_sh = min(begin_sh + timedelta(minutes=30), end_sh)
-    return earliest_sh, latest_sh
+    return begin_sh - timedelta(minutes=5), min(
+        begin_sh + timedelta(minutes=30), end_sh
+    )
 
 
 def compute_classroom_signin_window(
-    begin_sh: datetime,
-    end_sh: datetime,
-    offset_minutes: int,
+    begin_sh: datetime, end_sh: datetime, offset_minutes: int
 ) -> tuple[datetime, datetime] | None:
-    """Compute sign-in window clamped strictly within the platform sign-in bounds."""
+    """Sign-in window starting at begin + offset, clamped to the platform bounds."""
     earliest_sh, latest_sh = classroom_signin_bounds(begin_sh, end_sh)
-    if latest_sh <= earliest_sh:
-        return None
-    desired_start_sh = begin_sh + timedelta(minutes=offset_minutes)
-    win_start_sh = max(earliest_sh, desired_start_sh)
-    if win_start_sh >= latest_sh:
-        return None
-    return win_start_sh, latest_sh
-
-
-def _get_advance_minutes(
-    session: Session, event_type: str, module: str, default: int = 15
-) -> int:
-    rule = (
-        session.query(NotificationRule)
-        .filter_by(event_type=event_type, module=module)
-        .first()
-    )
-    if rule:
-        return max(0, int(rule.advance_minutes))
-    return default
+    start_sh = max(earliest_sh, begin_sh + timedelta(minutes=offset_minutes))
+    return (start_sh, latest_sh) if start_sh < latest_sh else None
 
 
 def parse_classroom_dt(value: str, date_str: str) -> datetime | None:
@@ -206,10 +240,9 @@ def parse_classroom_dt(value: str, date_str: str) -> datetime | None:
         except ValueError:
             continue
     if len(text) in (5, 8) and ":" in text:
-        d = datetime.strptime(date_str, "%Y%m%d").date()
-        fmt = "%H:%M:%S" if len(text) == 8 else "%H:%M"
-        t = datetime.strptime(text, fmt).time()
-        return datetime.combine(d, t, tzinfo=SHANGHAI_TZ)
+        day = datetime.strptime(date_str, "%Y%m%d").date()
+        tod = datetime.strptime(text, "%H:%M:%S" if len(text) == 8 else "%H:%M").time()
+        return datetime.combine(day, tod, tzinfo=SHANGHAI_TZ)
     return None
 
 
@@ -217,28 +250,25 @@ async def sync_classroom_today(
     session_factory: Any,
     session_mgr: BuaaSessionManager,
     registry: TaskRegistry,
-    clock: Clock | None = None,
-    *,
-    auto_schedule: bool = True,
+    clock: Clock,
 ) -> list[ClassroomCourse]:
-    clk = clock or default_clock
-    now_sh = clk.now_shanghai()
+    now_sh = clock.now_shanghai()
     date_str = now_sh.strftime("%Y%m%d")
+    with session_factory() as session:
+        network_mode = get_network_mode(session)
+        mod = session.get(ModuleConfig, "classroom")
+        enabled = mod.enabled
+        auto_sign = mod.config_json.get("auto_sign", True)
+        offset_minutes = int(mod.config_json.get("signin_offset_minutes", -5))
+
+    courses = await ClassroomClient(session_mgr, network_mode).get_today_courses(
+        date_str
+    )
+    now_utc = clock.now_utc()
 
     with session_factory() as session:
-        mod_cfg = _get_module_config(session, "classroom")
-        network_mode = get_unified_network_mode(session)
-        cfg_json = dict(mod_cfg.config_json or {})
-        offset_min = resolve_classroom_offset_minutes(cfg_json)
-        poll_interval = 30
-        mod_enabled = mod_cfg.enabled
-
-    client = ClassroomClient(session_mgr, network_mode=network_mode)
-    courses = await client.get_today_courses(date_str)
-
-    now_utc = clk.now_utc()
-
-    with session_factory() as session:
+        refresh = CourseRefresh(session, registry, "classroom", clock)
+        advance = _reminder_advance(session, "signin_reminder", "classroom", 15)
         session.query(ClassroomCourseCache).filter_by(course_date=date_str).delete()
         for c in courses:
             cached = ClassroomCourseCache(
@@ -254,162 +284,101 @@ async def sync_classroom_today(
             session.add(cached)
             begin_sh = parse_classroom_dt(c.class_begin_time, date_str)
             end_sh = parse_classroom_dt(c.class_end_time, date_str)
-            if begin_sh and end_sh:
-                if course_window_completed(
-                    session,
-                    f"classroom:signin:{date_str}:{c.course_sched_id}",
-                    classroom_signin_bounds(begin_sh, end_sh)[1],
-                ):
-                    c.sign_status = 1
-                    cached.sign_status = 1
-                # Reminder 15 minutes before class start (or immediate if already inside)
-                rem_adv = _get_advance_minutes(
-                    session, "signin_reminder", "classroom", 15
+            if not begin_sh or not end_sh:
+                continue
+            window_key = f"classroom:signin:{date_str}:{c.course_sched_id}"
+            if refresh.window_completed(
+                window_key, classroom_signin_bounds(begin_sh, end_sh)[1]
+            ):
+                c.sign_status = cached.sign_status = 1
+            if not enabled or c.signed:
+                continue
+            if now_sh < end_sh:
+                refresh.remind(
+                    event_type="signin_reminder",
+                    event_key=f"classroom:reminder:{c.course_sched_id}:{date_str}",
+                    payload={
+                        "title": f"课堂签到提醒: {c.course_name}",
+                        "course_name": c.course_name,
+                        "message": f"上课时间 {begin_sh:%H:%M} ~ {end_sh:%H:%M}",
+                    },
+                    send_at=(begin_sh - advance).astimezone(UTC_TZ),
+                    expires_at=end_sh.astimezone(UTC_TZ),
                 )
-                rem_start = begin_sh - timedelta(minutes=rem_adv)
-                if mod_enabled and not c.signed and now_sh < end_sh:
-                    publish_event(
-                        session,
-                        event_type="signin_reminder",
-                        event_key=f"classroom:reminder:{c.course_sched_id}:{date_str}",
-                        module="classroom",
-                        payload={
-                            "title": f"课堂签到提醒: {c.course_name}",
-                            "course_name": c.course_name,
-                            "message": f"上课时间 {begin_sh.strftime('%H:%M')} ~ {end_sh.strftime('%H:%M')}",
-                        },
-                        send_at=rem_start.astimezone(UTC_TZ),
-                        expires_at=end_sh.astimezone(UTC_TZ),
-                        clock=clk,
-                    )
-
-                win = compute_classroom_signin_window(begin_sh, end_sh, offset_min)
-                if win is not None:
-                    win_start_sh, win_end_sh = win
-                    if (
-                        auto_schedule
-                        and mod_enabled
-                        and cfg_json.get("auto_sign", True)
-                        and not c.signed
-                        and now_sh < win_end_sh
-                    ):
-                        plan_course_schedule(
-                            session,
-                            registry,
-                            name=f"课堂签到: {c.course_name}",
-                            task_type="classroom.auto_signin",
-                            parameters={
-                                "course_sched_id": c.course_sched_id,
-                                "course_name": c.course_name,
-                                "course_date": date_str,
-                            },
-                            trigger_type="window",
-                            trigger_config={
-                                "start_at": win_start_sh.strftime("%Y-%m-%d %H:%M:%S"),
-                                "end_at": win_end_sh.strftime("%Y-%m-%d %H:%M:%S"),
-                                "poll_interval_seconds": poll_interval,
-                            },
-                            business_key=f"classroom:signin:{date_str}:{c.course_sched_id}",
-                            enabled=True,
-                            clock=clk,
-                        )
-
-        finish_course_refresh(session, "classroom", auto_schedule=auto_schedule)
-        mod_cfg = _get_module_config(session, "classroom")
-        mod_cfg.health_status = "healthy"
-        mod_cfg.last_error = None
-        mod_cfg.last_checked_at = now_utc
-
+            window = compute_classroom_signin_window(begin_sh, end_sh, offset_minutes)
+            if auto_sign and window and now_sh < window[1]:
+                refresh.plan_window(
+                    name=f"课堂签到: {c.course_name}",
+                    task_type="classroom.auto_signin",
+                    business_key=window_key,
+                    parameters={
+                        "course_sched_id": c.course_sched_id,
+                        "course_name": c.course_name,
+                        "course_date": date_str,
+                    },
+                    start=window[0],
+                    end=window[1],
+                )
+        refresh.finish()
+        set_module_health(session, "classroom", now_utc)
         session.commit()
-
     return courses
 
 
 async def sync_td_progress(
-    session_factory: Any,
-    session_mgr: BuaaSessionManager,
-    clock: Clock | None = None,
+    session_factory: Any, session_mgr: BuaaSessionManager, clock: Clock
 ) -> TdOverviewData:
-    clk = clock or default_clock
     with session_factory() as session:
-        network_mode = get_unified_network_mode(session)
+        network_mode = get_network_mode(session)
         account = session.query(CampusAccount).first()
         if not account or not account.student_id:
             raise BuaaError("请先配置校园账号")
         student_id = account.student_id
     overview = await TdClient(session_mgr, network_mode).get_overview()
-    now = clk.now_utc()
+    now = clock.now_utc()
     with session_factory() as session:
         account = session.query(CampusAccount).first()
         if not account or account.student_id != student_id:
             raise BuaaError("校园账号已变更，请重新刷新体能锻炼状态")
-        snapshot = session.get(BusinessCacheSnapshot, "td_overview")
-        payload = {**asdict(overview), "student_id": student_id}
-        if snapshot is None:
-            session.add(
-                BusinessCacheSnapshot(
-                    key="td_overview", payload_json=payload, synced_at=now
-                )
-            )
-        else:
-            snapshot.payload_json = payload
-            snapshot.synced_at = now
-        mod = _get_module_config(session, "td")
-        mod.health_status = "healthy"
-        mod.last_error = None
-        mod.last_checked_at = now
+        save_snapshot(
+            session, "td_overview", {**asdict(overview), "student_id": student_id}, now
+        )
+        set_module_health(session, "td", now)
         session.commit()
     return overview
 
 
+def _sunshine_reminder_due(overview: YgdkOverviewData) -> bool:
+    """Remind only while both the term and the week are below their platform targets."""
+    term, week = overview.term_count, overview.week_count
+    return (
+        term is not None
+        and week is not None
+        and 0 <= term < (overview.term_target or 0)
+        and 0 <= week < (overview.week_target or 0)
+    )
+
+
 async def sync_ygdk_progress(
-    session_factory: Any,
-    session_mgr: BuaaSessionManager,
-    clock: Clock | None = None,
+    session_factory: Any, session_mgr: BuaaSessionManager, clock: Clock
 ) -> YgdkOverviewData:
-    clk = clock or default_clock
-    now_utc = clk.now_utc()
+    network_mode = read_network_mode(session_factory)
+    overview = await YgdkClient(session_mgr, network_mode).get_overview()
+    now_utc = clock.now_utc()
+    now_sh = clock.now_shanghai()
     with session_factory() as session:
-        _get_module_config(session, "ygdk")
-        network_mode = get_unified_network_mode(session)
-
-    client = YgdkClient(session_mgr, network_mode=network_mode)
-    overview = await client.get_overview()
-
-    with session_factory() as session:
-        snap = session.get(BusinessCacheSnapshot, "ygdk_overview")
-        payload = asdict(overview)
-        if snap is None:
-            session.add(
-                BusinessCacheSnapshot(
-                    key="ygdk_overview", payload_json=payload, synced_at=now_utc
-                )
-            )
-        else:
-            snap.payload_json = payload
-            snap.synced_at = now_utc
-
-        mod_cfg = _get_module_config(session, "ygdk")
-        reminder_time = (mod_cfg.config_json or {}).get("reminder_time", "18:00")
-        now_sh = clk.now_shanghai()
+        save_snapshot(session, "ygdk_overview", asdict(overview), now_utc)
+        mod = session.get(ModuleConfig, "ygdk")
+        reminder_time = mod.config_json.get("reminder_time", "18:00")
         if (
-            mod_cfg.enabled
+            mod.enabled
             and now_sh.strftime("%H:%M") >= reminder_time
-            and overview.term_target is not None
-            and overview.term_target > 0
-            and overview.week_target is not None
-            and overview.week_target > 0
-            and overview.term_count is not None
-            and overview.term_count >= 0
-            and overview.week_count is not None
-            and overview.week_count >= 0
-            and overview.term_count < overview.term_target
-            and overview.week_count < overview.week_target
+            and _sunshine_reminder_due(overview)
         ):
             tomorrow = (now_sh + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
-            _publish_event(
+            publish_event(
                 session,
                 event_type="exercise_reminder",
                 module="ygdk",
@@ -419,318 +388,228 @@ async def sync_ygdk_progress(
                     "message": f"本学期 {overview.term_count}/{overview.term_target} 次，本周 {overview.week_count}/{overview.week_target} 次，记得打卡。",
                 },
                 expires_at=tomorrow.astimezone(UTC_TZ),
-                clock=clk,
+                clock=clock,
             )
         else:
-            for event in (
-                session.query(NotificationEvent)
-                .filter_by(
+            expire_events(
+                session.query(NotificationEvent).filter_by(
                     module="ygdk", event_type="exercise_reminder", status="pending"
                 )
-                .all()
-            ):
-                event.status = "expired"
-                event.next_retry_at = None
-        mod_cfg.health_status = "healthy"
-        mod_cfg.last_error = None
-        mod_cfg.last_checked_at = now_utc
+            )
+        set_module_health(session, "ygdk", now_utc)
         session.commit()
-
     return overview
 
 
-def _sync_boya_course_notifications(
-    session: Session,
-    c: BoyaCourseData,
-    *,
-    cid: int,
-    user_campus: str,
-    now_sh: datetime,
-    now_utc: datetime,
-    clk: Clock,
+@dataclass(frozen=True)
+class _SignAction:
+    action: str  # notification/task suffix: signin | signout
+    label: str
+    config_prefix: str  # key prefix inside the platform sign config
+    key_prefix: str  # schedule business key prefix
+    pending_checkins: tuple[int | None, ...]  # attendance codes meaning "not done yet"
+
+
+_SIGN_ACTIONS = (
+    _SignAction("signin", "签到", "sign", "sign", (None, 0)),
+    _SignAction("signout", "签退", "signOut", "signout", (None, 0, 5, 6)),
+)
+
+_CACHE_FIELDS = (
+    "name",
+    "location",
+    "category",
+    "sub_category",
+    "sign_method",
+    "has_autonomous_sign",
+    "selected",
+    "chosen_id",
+    "course_start",
+    "course_end",
+    "select_start",
+    "select_end",
+    "cancel_end",
+    "current_count",
+    "max_count",
+    "campus",
+    "sign_type",
+    "checkin",
+    "pass_status",
+    "score",
+)
+
+
+def _merge_chosen(
+    courses: list[BoyaCourseData], chosen: list[BoyaCourseData]
+) -> dict[int, BoyaCourseData]:
+    """Overlay enrollment state from the chosen list onto the catalogue courses."""
+    merged = {c.course_id: c for c in courses}
+    for ch in chosen:
+        base = merged.setdefault(ch.course_id, ch)
+        if base is ch:
+            continue
+        base.selected = True
+        base.chosen_id = ch.chosen_id
+        base.checkin = ch.checkin
+        base.pass_status = ch.pass_status
+        base.score = ch.score
+        if not base.sign_config and ch.sign_config:
+            base.sign_config = ch.sign_config
+            base.has_autonomous_sign = ch.has_autonomous_sign
+            base.sign_method = ch.sign_method
+    return merged
+
+
+def _remind_boya_signup(
+    refresh: CourseRefresh, c: BoyaCourseData, user_campus: str, advance: timedelta
 ) -> None:
-    """Publish discovery and scheduled pre-selection notifications for a Boya course."""
     s_start = parse_boya_dt(c.select_start)
     s_end = parse_boya_dt(c.select_end)
-    if not s_start or not s_end:
-        return
-
-    resolved_campus = c.resolved_campus or infer_course_campus(c)
-    campus_ok = user_campus == "全部" or course_matches_campus(c, user_campus)
-
-    adv = _get_advance_minutes(session, "signup_reminder", "boya", 5)
-    rem_key = f"boya:signup_rem:{cid}:{c.select_start}"
-    pending_rems = (
-        session.query(NotificationEvent)
-        .filter(
-            NotificationEvent.module == "boya",
-            NotificationEvent.event_type == "signup_reminder",
-            NotificationEvent.event_key.like(f"boya:signup_rem:{cid}:%"),
-            NotificationEvent.status == "pending",
-        )
-        .all()
-    )
-
+    now_utc = refresh.clock.now_utc()
     if (
-        not c.selected
-        and now_sh < s_end
-        and campus_ok
-        and (not c.max_count or (c.current_count or 0) < c.max_count)
+        not s_start
+        or not s_end
+        or c.selected
+        or refresh.clock.now_shanghai() >= s_end
+        or (user_campus != "全部" and not course_matches_campus(c, user_campus))
+        or (c.max_count and (c.current_count or 0) >= c.max_count)
     ):
-        target_send_sh = s_start - timedelta(minutes=adv)
-        send_at_utc = max(now_utc, target_send_sh.astimezone(UTC_TZ))
-        s_end_utc = s_end.astimezone(UTC_TZ)
-        if send_at_utc >= s_end_utc:
-            send_at_utc = now_utc
-
-        for rem in pending_rems:
-            if rem.event_key != rem_key:
-                rem.status = "expired"
-                rem.next_retry_at = None
-
-        payload = {
+        return
+    s_end_utc = s_end.astimezone(UTC_TZ)
+    send_at = max(now_utc, (s_start - advance).astimezone(UTC_TZ))
+    campus = c.resolved_campus or infer_course_campus(c)
+    refresh.remind(
+        event_type="signup_reminder",
+        event_key=f"boya:signup_rem:{c.course_id}:{c.select_start}",
+        payload={
             "title": f"博雅选课提醒: {c.name}",
             "course_name": c.name,
-            "campus": resolved_campus,
+            "campus": campus,
             "location": c.location,
             "message": (
                 f"分类: {c.sub_category or '未分类'} / {c.sign_method}"
-                f"\n地点: {resolved_campus} {c.location}".rstrip()
+                f"\n地点: {campus} {c.location}".rstrip()
                 + f"\n选课: {s_start:%m-%d %H:%M} ~ {s_end:%m-%d %H:%M}"
             ),
-        }
+        },
+        send_at=send_at if send_at < s_end_utc else now_utc,
+        expires_at=s_end_utc,
+    )
 
-        publish_event(
-            session,
-            event_type="signup_reminder",
-            event_key=rem_key,
-            module="boya",
-            payload=payload,
-            send_at=send_at_utc,
-            expires_at=s_end_utc,
-            clock=clk,
-        )
-    else:
-        for rem in pending_rems:
-            rem.status = "expired"
-            rem.next_retry_at = None
+
+def _sync_boya_sign_windows(
+    refresh: CourseRefresh, c: BoyaCourseData, auto_sign: bool
+) -> None:
+    now_sh = refresh.clock.now_shanghai()
+    cfg = c.sign_config or {}
+    course_times = {
+        "signin": (c.course_start, c.course_end),
+        "signout": (c.course_end, None),
+    }
+    for spec in _SIGN_ACTIONS:
+        start = parse_boya_dt(cfg.get(f"{spec.config_prefix}StartDate"))
+        end = parse_boya_dt(cfg.get(f"{spec.config_prefix}EndDate"))
+        business_key = f"boya:{spec.key_prefix}:{c.course_id}"
+        if c.checkin not in spec.pending_checkins or (
+            end and refresh.window_completed(business_key, end)
+        ):
+            continue
+
+        # Regular courses have no sign window; remind around the course time instead.
+        course_time, course_time_end = course_times[spec.action]
+        reminder_start = start or parse_boya_dt(course_time)
+        reminder_end = end or parse_boya_dt(course_time_end)
+        if reminder_start and not reminder_end:
+            reminder_end = reminder_start + timedelta(minutes=15)
+        if reminder_start and reminder_end and now_sh < reminder_end:
+            event_type = f"{spec.action}_reminder"
+            advance = _reminder_advance(refresh.session, event_type, "boya", 15)
+            refresh.remind(
+                event_type=event_type,
+                event_key=f"boya:{spec.action}_rem:{c.course_id}:{cfg.get(f'{spec.config_prefix}StartDate') or course_time}",
+                payload={
+                    "title": f"博雅{spec.label}提醒: {c.name}",
+                    "course_name": c.name,
+                    "message": f"{spec.label}时间 {start:%m-%d %H:%M} ~ {end:%H:%M}"
+                    if start and end
+                    else f"课程{'开始' if spec.action == 'signin' else '结束'}时间 {reminder_start:%m-%d %H:%M}",
+                },
+                send_at=(reminder_start - advance).astimezone(UTC_TZ),
+                expires_at=reminder_end.astimezone(UTC_TZ),
+            )
+
+        if (
+            auto_sign
+            and c.has_autonomous_sign
+            and start
+            and end
+            and start < end
+            and now_sh < end
+        ):
+            refresh.plan_window(
+                name=f"博雅自主{spec.label}: {c.name}",
+                task_type=f"boya.auto_{spec.action}",
+                business_key=business_key,
+                parameters={"course_id": c.course_id, "course_name": c.name},
+                start=start,
+                end=end,
+            )
 
 
 async def sync_boya_all(
     session_factory: Any,
     session_mgr: BuaaSessionManager,
     registry: TaskRegistry,
-    clock: Clock | None = None,
-    *,
-    auto_schedule: bool = True,
+    clock: Clock,
 ) -> tuple[list[BoyaCourseData], list[BoyaCourseData], BoyaStatsData]:
-    clk = clock or default_clock
-    now_sh = clk.now_shanghai()
-    now_utc = clk.now_utc()
-
     with session_factory() as session:
-        mod_cfg = _get_module_config(session, "boya")
-        network_mode = get_unified_network_mode(session)
-        cfg_json = dict(mod_cfg.config_json or {})
-        mod_enabled = mod_cfg.enabled
+        network_mode = get_network_mode(session)
+        mod = session.get(ModuleConfig, "boya")
+        enabled = mod.enabled
+        auto_sign = bool(mod.config_json.get("auto_sign", True))
         account = session.query(CampusAccount).first()
         user_campus = (
             (account.campus if account else "北京")
-            if cfg_json.get("filter_by_campus", True)
+            if mod.config_json.get("filter_by_campus", True)
             else "全部"
         )
 
-    client = BoyaClient(session_mgr, network_mode=network_mode)
+    client = BoyaClient(session_mgr, network_mode)
     all_config = await client.get_all_config()
-    sem_start, sem_end = resolve_semester_window(all_config, now_sh)
+    sem_start, sem_end = resolve_semester_window(all_config, clock.now_shanghai())
     courses = await client.query_courses()
     chosen = await client.query_chosen_courses(sem_start, sem_end)
     stats = await client.query_statistics()
+    now_utc = clock.now_utc()
 
-    chosen_by_id = {c.course_id: c for c in chosen}
-    auto_sign_enabled = bool(cfg_json.get("auto_sign", True))
-    poll_interval = 30
     with session_factory() as session:
-        merged_by_id: dict[int, BoyaCourseData] = {c.course_id: c for c in courses}
-        for cid, ch in chosen_by_id.items():
-            if cid in merged_by_id:
-                base = merged_by_id[cid]
-                base.selected = True
-                base.chosen_id = ch.chosen_id
-                base.checkin = ch.checkin
-                base.pass_status = ch.pass_status
-                base.score = ch.score
-                if not base.sign_config and ch.sign_config:
-                    base.sign_config = ch.sign_config
-                    base.has_autonomous_sign = ch.has_autonomous_sign
-                    base.sign_method = ch.sign_method
-            else:
-                merged_by_id[cid] = ch
-
+        refresh = CourseRefresh(session, registry, "boya", clock)
+        signup_advance = _reminder_advance(session, "signup_reminder", "boya", 5)
+        merged = _merge_chosen(courses, chosen)
         session.query(BoyaCourseCache).filter(
-            BoyaCourseCache.course_id.notin_(merged_by_id)
+            BoyaCourseCache.course_id.notin_(merged)
         ).delete(synchronize_session=False)
 
-        for cid, c in merged_by_id.items():
+        for cid, c in merged.items():
             cached = session.get(BoyaCourseCache, cid)
             if cached is None:
-                cached = BoyaCourseCache(course_id=cid, name=c.name)
+                cached = BoyaCourseCache(course_id=cid)
                 session.add(cached)
-            cached.name = c.name
-            cached.location = c.location
-            cached.category = c.category
-            cached.sub_category = c.sub_category
-            cached.sign_method = c.sign_method
-            cached.has_autonomous_sign = c.has_autonomous_sign
-            cached.selected = c.selected
-            cached.chosen_id = c.chosen_id
-            cached.course_start = c.course_start
-            cached.course_end = c.course_end
-            cached.select_start = c.select_start
-            cached.select_end = c.select_end
-            cached.cancel_end = c.cancel_end
-            cached.current_count = c.current_count
-            cached.max_count = c.max_count
-            cached.campus = c.campus
+            for name in _CACHE_FIELDS:
+                setattr(cached, name, getattr(c, name))
             cached.sign_config_json = c.sign_config
-            cached.sign_type = c.sign_type
-            cached.checkin = c.checkin
-            cached.pass_status = c.pass_status
-            cached.score = c.score
             cached.raw_json = c.raw
             cached.synced_at = now_utc
 
-            if mod_enabled:
-                _sync_boya_course_notifications(
-                    session,
-                    c,
-                    cid=cid,
-                    user_campus=user_campus,
-                    now_sh=now_sh,
-                    now_utc=now_utc,
-                    clk=clk,
-                )
+            if not enabled:
+                continue
+            _remind_boya_signup(refresh, c, user_campus, signup_advance)
+            if c.selected and c.pass_status != 1:
+                _sync_boya_sign_windows(refresh, c, auto_sign)
 
-            if mod_enabled and c.selected and c.pass_status != 1:
-                cfg = c.sign_config or {}
-                actions = (
-                    (
-                        "signin",
-                        "签到",
-                        "sign",
-                        "sign",
-                        c.checkin in (None, 0),
-                        c.course_start,
-                        c.course_end,
-                    ),
-                    (
-                        "signout",
-                        "签退",
-                        "signOut",
-                        "signout",
-                        c.checkin in (None, 0, 5, 6),
-                        c.course_end,
-                        None,
-                    ),
-                )
-                for (
-                    action,
-                    label,
-                    prefix,
-                    key_prefix,
-                    needed,
-                    course_time,
-                    course_end,
-                ) in actions:
-                    start = parse_boya_dt(cfg.get(f"{prefix}StartDate"))
-                    end = parse_boya_dt(cfg.get(f"{prefix}EndDate"))
-                    business_key = f"boya:{key_prefix}:{cid}"
-                    if not needed or (
-                        end and course_window_completed(session, business_key, end)
-                    ):
-                        continue
-                    reminder_start = start or parse_boya_dt(course_time)
-                    reminder_end = end or parse_boya_dt(course_end)
-                    if reminder_start and not reminder_end:
-                        reminder_end = reminder_start + timedelta(minutes=15)
-                    if reminder_start and reminder_end and now_sh < reminder_end:
-                        advance = _get_advance_minutes(
-                            session, f"{action}_reminder", "boya", 15
-                        )
-                        publish_event(
-                            session,
-                            event_type=f"{action}_reminder",
-                            event_key=f"boya:{action}_rem:{cid}:{cfg.get(f'{prefix}StartDate') or course_time}",
-                            module="boya",
-                            payload={
-                                "title": f"博雅{label}提醒: {c.name}",
-                                "course_name": c.name,
-                                "message": f"{label}时间 {start:%m-%d %H:%M} ~ {end:%H:%M}"
-                                if start and end
-                                else f"课程{'开始' if action == 'signin' else '结束'}时间 {reminder_start:%m-%d %H:%M}",
-                            },
-                            send_at=(
-                                reminder_start - timedelta(minutes=advance)
-                            ).astimezone(UTC_TZ),
-                            expires_at=reminder_end.astimezone(UTC_TZ),
-                            clock=clk,
-                        )
-                    if (
-                        auto_schedule
-                        and auto_sign_enabled
-                        and c.has_autonomous_sign
-                        and start
-                        and end
-                        and start < end
-                        and now_sh < end
-                    ):
-                        plan_course_schedule(
-                            session,
-                            registry,
-                            name=f"博雅自主{label}: {c.name}",
-                            task_type=f"boya.auto_{action}",
-                            parameters={"course_id": cid, "course_name": c.name},
-                            trigger_type="window",
-                            trigger_config={
-                                "start_at": start.strftime("%Y-%m-%d %H:%M:%S"),
-                                "end_at": end.strftime("%Y-%m-%d %H:%M:%S"),
-                                "poll_interval_seconds": poll_interval,
-                            },
-                            business_key=business_key,
-                            enabled=True,
-                            clock=clk,
-                        )
-
-        snap = session.get(BusinessCacheSnapshot, "boya_statistics")
-        stats_payload = {
-            "valid_count": stats.valid_count,
-            "categories": [
-                {
-                    "category": cs.category,
-                    "sub_category": cs.sub_category,
-                    "required_count": cs.required_count,
-                    "passed_count": cs.passed_count,
-                }
-                for cs in stats.categories
-            ],
-            "raw": stats.raw,
-        }
-        if snap is None:
-            session.add(
-                BusinessCacheSnapshot(
-                    key="boya_statistics", payload_json=stats_payload, synced_at=now_utc
-                )
-            )
-        else:
-            snap.payload_json = stats_payload
-            snap.synced_at = now_utc
-
-        finish_course_refresh(session, "boya", auto_schedule=auto_schedule)
-        mod_cfg = _get_module_config(session, "boya")
-        mod_cfg.health_status = "healthy"
-        mod_cfg.last_error = None
-        mod_cfg.last_checked_at = now_utc
-
+        save_snapshot(session, "boya_statistics", asdict(stats), now_utc)
+        refresh.finish()
+        set_module_health(session, "boya", now_utc)
         session.commit()
 
     return courses, chosen, stats

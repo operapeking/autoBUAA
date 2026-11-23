@@ -4,7 +4,8 @@ import secrets
 from typing import Any
 
 from app.api.deps import require_admin
-from app.core.crypto import mask_secret
+from app.container import AppContainer
+from app.core.crypto import SecretCipher, mask_secret
 from app.core.time import format_shanghai_iso
 from app.db.models import (
     NotificationChannel,
@@ -12,6 +13,7 @@ from app.db.models import (
     NotificationEvent,
     NotificationRule,
 )
+from app.modules.automation import request_module_refresh
 from app.notifications.service import publish_event
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -36,12 +38,10 @@ class RuleUpdatePayload(BaseModel):
 
 class TestPushPayload(BaseModel):
     title: str = Field(default="autoBUAA 测试推送", max_length=128)
-    body: str = Field(
-        default="收到这条消息说明 Bark 通知配置正常。", max_length=500
-    )
+    body: str = Field(default="收到这条消息说明 Bark 通知配置正常。", max_length=500)
 
 
-def _serialize_channel(ch: NotificationChannel, cipher: Any) -> dict[str, Any]:
+def _serialize_channel(ch: NotificationChannel, cipher: SecretCipher) -> dict[str, Any]:
     raw_key = cipher.decrypt(ch.encrypted_device_key)
     return {
         "id": ch.id,
@@ -57,7 +57,9 @@ def _serialize_channel(ch: NotificationChannel, cipher: Any) -> dict[str, Any]:
 
 
 @router.get("/channels")
-def list_channels(container: Any = Depends(require_admin)) -> list[dict[str, Any]]:
+def list_channels(
+    container: AppContainer = Depends(require_admin),
+) -> list[dict[str, Any]]:
     with container.session_factory() as session:
         rows = (
             session.query(NotificationChannel)
@@ -71,7 +73,7 @@ def list_channels(container: Any = Depends(require_admin)) -> list[dict[str, Any
 def update_channel(
     channel_id: int,
     payload: ChannelUpdatePayload,
-    container: Any = Depends(require_admin),
+    container: AppContainer = Depends(require_admin),
 ) -> dict[str, Any]:
     with container.session_factory() as session:
         ch = session.get(NotificationChannel, channel_id)
@@ -98,7 +100,7 @@ def update_channel(
 async def test_channel_push(
     channel_id: int,
     payload: TestPushPayload | None = None,
-    container: Any = Depends(require_admin),
+    container: AppContainer = Depends(require_admin),
 ) -> dict[str, Any]:
     body_data = payload or TestPushPayload()
     with container.session_factory() as session:
@@ -140,29 +142,32 @@ RULE_DESCRIPTIONS: dict[tuple[str, str], str] = {
 }
 
 
+def _serialize_rule(rule: NotificationRule) -> dict[str, Any]:
+    return {
+        "id": rule.id,
+        "event_type": rule.event_type,
+        "module": rule.module,
+        "enabled": rule.enabled,
+        "advance_minutes": rule.advance_minutes,
+        "channel_id": rule.channel_id,
+        "description": RULE_DESCRIPTIONS.get((rule.event_type, rule.module), ""),
+    }
+
+
 @router.get("/rules")
-def list_rules(container: Any = Depends(require_admin)) -> list[dict[str, Any]]:
+def list_rules(
+    container: AppContainer = Depends(require_admin),
+) -> list[dict[str, Any]]:
     with container.session_factory() as session:
         rows = session.query(NotificationRule).order_by(NotificationRule.id.asc()).all()
-        return [
-            {
-                "id": r.id,
-                "event_type": r.event_type,
-                "module": r.module,
-                "enabled": r.enabled,
-                "advance_minutes": r.advance_minutes,
-                "channel_id": r.channel_id,
-                "description": RULE_DESCRIPTIONS.get((r.event_type, r.module), ""),
-            }
-            for r in rows
-        ]
+        return [_serialize_rule(r) for r in rows]
 
 
 @router.put("/rules/{rule_id}")
 def update_rule(
     rule_id: int,
     payload: RuleUpdatePayload,
-    container: Any = Depends(require_admin),
+    container: AppContainer = Depends(require_admin),
 ) -> dict[str, Any]:
     with container.session_factory() as session:
         rule = session.get(NotificationRule, rule_id)
@@ -172,27 +177,18 @@ def update_rule(
         rule.advance_minutes = payload.advance_minutes
         if payload.channel_id is not None:
             rule.channel_id = payload.channel_id
+        # Course reminders are scheduled during refreshes; rebuild them with the new timing.
         if rule.module in {"classroom", "boya"}:
-            from app.modules.automation import request_module_refresh
-
             request_module_refresh(session, rule.module, container.clock)
         session.commit()
-        session.refresh(rule)
-        return {
-            "id": rule.id,
-            "event_type": rule.event_type,
-            "module": rule.module,
-            "enabled": rule.enabled,
-            "advance_minutes": rule.advance_minutes,
-            "channel_id": rule.channel_id,
-        }
+        return _serialize_rule(rule)
 
 
 @router.get("/events")
 def list_events(
     status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=50, ge=1, le=200),
-    container: Any = Depends(require_admin),
+    container: AppContainer = Depends(require_admin),
 ) -> list[dict[str, Any]]:
     with container.session_factory() as session:
         q = session.query(NotificationEvent)
@@ -241,7 +237,7 @@ def list_events(
 @router.post("/events/{event_id}/retry")
 async def retry_notification_event(
     event_id: int,
-    container: Any = Depends(require_admin),
+    container: AppContainer = Depends(require_admin),
 ) -> dict[str, Any]:
     with container.session_factory() as session:
         ev = session.get(NotificationEvent, event_id)

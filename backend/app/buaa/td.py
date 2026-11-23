@@ -10,8 +10,6 @@ import httpx
 from .exceptions import BuaaError, SessionExpiredError
 from .sso import BuaaSessionManager, looks_like_login_page
 from .webvpn import (
-    EndpointDiagnostic,
-    diagnose_host_connection,
     is_vpn_gateway_url,
     route_url,
 )
@@ -122,9 +120,6 @@ class TdClient:
     ) -> None:
         self.session_mgr = session_mgr
         self.network_mode = network_mode
-
-    def diagnose(self) -> EndpointDiagnostic:
-        return diagnose_host_connection(TD_ENTRY_URL, self.network_mode)
 
     async def _get(self, client: httpx.AsyncClient, url: str) -> str:
         response = await client.get(route_url(url, self.network_mode))

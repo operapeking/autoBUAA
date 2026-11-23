@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import Awaitable, Callable, Iterator, TypeVar
+
+from app.buaa.exceptions import BuaaError, CaptchaRequiredError
 from app.container import AppContainer
 from app.core.crypto import hash_session_token
 from app.db.models import AdminSession, SystemSetting
+from app.modules.services import mark_module_error
 from fastapi import Depends, HTTPException, Request, status
+
+T = TypeVar("T")
 
 SESSION_COOKIE_NAME = "autobuaa_session"
 
@@ -50,3 +57,27 @@ def require_admin(
             detail="未登录或会话已过期",
         )
     return container
+
+
+async def run_module_sync(
+    container: AppContainer, module: str, sync: Callable[[], Awaitable[T]]
+) -> T:
+    """Run a manual refresh under the module lock, mapping upstream errors to HTTP 400."""
+    async with container.scheduler.module_lock(module):
+        try:
+            return await sync()
+        except CaptchaRequiredError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except BuaaError as exc:
+            mark_module_error(
+                container.session_factory, module, str(exc), container.clock
+            )
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@contextmanager
+def upstream_errors() -> Iterator[None]:
+    try:
+        yield
+    except BuaaError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc

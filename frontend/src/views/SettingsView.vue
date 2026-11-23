@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { reactive, ref } from 'vue';
-import { api, networkNames, type AccountInfo, type CampusOption, type NetworkMode } from '@/api/client';
+import { api, type AccountInfo, type CampusOption, type NetworkMode } from '@/api/client';
+import { networkNames } from '@/lib/format';
 import { useLive } from '@/composables/useLive';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
-import NotificationsView from './NotificationsView.vue';
+import NotificationSettings from '@/components/NotificationSettings.vue';
 const account = ref<AccountInfo | null>(null);
 const form = reactive({ student_id: '', password: '', campus: '北京' as CampusOption, network_mode: 'webvpn' as NetworkMode });
 const captcha = ref(''), error = ref(''), message = ref(''), busy = ref(false);
@@ -23,7 +24,7 @@ async function act(fn: () => Promise<void>) {
 }
 async function saveAndLogin() {
   await api.account.update({ student_id: form.student_id, campus: form.campus, enabled: true, password: form.password || undefined });
-  await api.network.setMode(form.network_mode); form.password = '';
+  await api.network.set(form.network_mode); form.password = '';
   const result = await api.account.login();
   message.value = result.ok ? '校园账号已连接' : result.message || '请输入验证码';
 }
@@ -41,7 +42,7 @@ const authNames: Record<string, string> = { authenticated: '已连接', configur
       </div><p v-if="account?.auth_error" class="text-sm text-destructive">{{ account.auth_error }}</p><Button :disabled="busy || !initialized" type="submit">{{ busy ? '正在连接…' : '保存并连接' }}</Button></form>
       <form v-if="account?.auth_status === 'captcha_required'" class="mt-6 flex gap-3 items-center flex-wrap" @submit.prevent="act(async () => { const result = await api.account.submitCaptcha(captcha); if (!result.ok) throw new Error(result.message || '验证码认证失败'); captcha = ''; message = '校园账号已连接'; })"><img v-if="account.has_captcha_image" :src="`/api/v1/account/captcha/image?v=${account.updated_at}`" alt="统一认证验证码" class="h-12 rounded border" /><Input v-model="captcha" aria-label="验证码" class="w-36" required placeholder="验证码" /><Button type="submit" :disabled="busy">提交验证码</Button></form>
     </CardContent></Card>
-    <NotificationsView />
+    <NotificationSettings />
     <Card><CardHeader><CardTitle>管理员密码</CardTitle></CardHeader><CardContent><form class="flex flex-wrap gap-3" @submit.prevent="act(async () => { await api.auth.changePassword(passwords.old, passwords.next); passwords.old = ''; passwords.next = ''; message = '管理员密码已更新'; })"><Input v-model="passwords.old" aria-label="当前管理员密码" type="password" autocomplete="current-password" required placeholder="当前密码" class="sm:w-52" /><Input v-model="passwords.next" aria-label="新管理员密码" type="password" autocomplete="new-password" minlength="6" required placeholder="新密码（至少 6 位）" class="sm:w-52" /><Button variant="outline" type="submit" :disabled="busy">修改密码</Button></form></CardContent></Card>
   </div>
 </template>

@@ -4,7 +4,19 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from app.api.v1 import account, auth, health, modules, network, notifications, tasks
+from app.api.v1 import (
+    account,
+    auth,
+    boya,
+    classroom,
+    health,
+    modules,
+    network,
+    notifications,
+    tasks,
+    td,
+    ygdk,
+)
 from app.container import AppContainer
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
@@ -30,14 +42,20 @@ def create_app(
     app = FastAPI(title="autoBUAA", version="0.1.0", lifespan=lifespan)
     app.state.container = app_container
 
-    api_prefix = "/api/v1"
-    app.include_router(auth.router, prefix=api_prefix)
-    app.include_router(account.router, prefix=api_prefix)
-    app.include_router(network.router, prefix=api_prefix)
-    app.include_router(modules.router, prefix=api_prefix)
-    app.include_router(tasks.router, prefix=api_prefix)
-    app.include_router(notifications.router, prefix=api_prefix)
-    app.include_router(health.router, prefix=api_prefix)
+    for router_module in (
+        auth,
+        account,
+        network,
+        modules,
+        classroom,
+        boya,
+        ygdk,
+        td,
+        tasks,
+        notifications,
+        health,
+    ):
+        app.include_router(router_module.router, prefix="/api/v1")
     app.include_router(health.router)  # Also expose /health for container healthchecks
 
     dist_dir = Path(app_container.settings.frontend_dist_dir)

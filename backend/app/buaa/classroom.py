@@ -12,11 +12,10 @@ from .exceptions import (
     BusinessTerminalError,
     OutcomeUnknownError,
     SessionExpiredError,
+    parse_int,
 )
 from .sso import BuaaSessionManager, looks_like_login_page
 from .webvpn import (
-    EndpointDiagnostic,
-    diagnose_host_connection,
     from_webvpn_url,
     is_vpn_gateway_url,
     route_url,
@@ -62,7 +61,7 @@ def _is_empty_status(value: Any) -> bool:
 def _action_status(value: Any) -> int | None:
     if value == "success":
         return 0
-    return _parse_int(value)
+    return parse_int(value)
 
 
 def _is_allowed_login_hop(url_str: str) -> bool:
@@ -79,16 +78,6 @@ def _is_allowed_login_hop(url_str: str) -> bool:
         return False
     except Exception:
         return False
-
-
-def _parse_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value.strip())
-    return None
 
 
 def _final_url_is_auth(url_str: str) -> bool:
@@ -130,7 +119,7 @@ def parse_today_courses(payload: dict[str, Any]) -> list[ClassroomCourse]:
         cid = str(row.get("id") or "").strip()
         if not cid:
             continue
-        sign_status = _parse_int(row.get("signStatus"))
+        sign_status = parse_int(row.get("signStatus"))
         courses.append(
             ClassroomCourse(
                 course_sched_id=cid,
@@ -156,14 +145,6 @@ class ClassroomClient:
     @property
     def _state_key(self) -> str:
         return f"iclass:{self.network_mode}"
-
-    def diagnose(self) -> EndpointDiagnostic:
-        target = (
-            "https://iclass.buaa.edu.cn:8347/app/common/get_timestamp.action"
-            if self.network_mode != "direct"
-            else "http://iclass.buaa.edu.cn:8081/app/common/get_timestamp.action"
-        )
-        return diagnose_host_connection(target, self.network_mode)
 
     async def _ensure_credential(self, force_refresh: bool = False) -> tuple[str, str]:
         if not force_refresh:
@@ -323,7 +304,7 @@ class ClassroomClient:
                 return ClassroomSignResult(
                     success=False, already_signed=False, message="签到未完成"
                 )
-            stu_status = _parse_int((body.get("result") or {}).get("stuSignStatus"))
+            stu_status = parse_int((body.get("result") or {}).get("stuSignStatus"))
             if stu_status == 1:
                 return ClassroomSignResult(
                     success=True, already_signed=False, message="课堂签到成功"

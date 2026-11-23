@@ -3,7 +3,7 @@ import { ref } from "vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card } from "@/components/ui/card";
-import { api, ApiError } from "../api/client";
+import { api, ApiError } from "@/api/client";
 
 const props = defineProps<{
   initialized: boolean;
@@ -53,14 +53,14 @@ async function handleSubmit() {
 <template>
   <div class="auth-page">
     <Card class="w-full max-w-sm p-7"><form @submit.prevent="handleSubmit">
-      <h1 style="margin: 0 0 6px; font-size: 22px">autoBUAA</h1>
-      <p style="margin: 0 0 18px; color: var(--text-muted)">
+      <h1 class="mb-1.5 text-[22px]">autoBUAA</h1>
+      <p class="mb-4.5 text-muted-foreground">
         {{ initialized ? "请输入管理员密码登录控制台" : "首次部署初始化：请设置单管理员密码" }}
       </p>
 
       <div v-if="error" class="error-box mb-4">{{ error }}</div>
 
-      <div class="field" style="margin-bottom: 12px">
+      <div class="field mb-3">
         <label for="admin-pwd">管理员密码</label>
         <Input
           id="admin-pwd"
@@ -71,7 +71,7 @@ async function handleSubmit() {
         />
       </div>
 
-      <div v-if="!initialized" class="field" style="margin-bottom: 16px">
+      <div v-if="!initialized" class="field mb-4">
         <label for="admin-pwd-confirm">确认密码</label>
         <Input
           id="admin-pwd-confirm"
@@ -82,7 +82,7 @@ async function handleSubmit() {
         />
       </div>
 
-      <Button style="width: 100%" type="submit" :disabled="loading">
+      <Button class="w-full" type="submit" :disabled="loading">
         {{ loading ? "提交中..." : initialized ? "登录" : "完成初始化并登录" }}
       </Button>
     </form></Card>

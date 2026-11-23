@@ -25,11 +25,10 @@ from .exceptions import (
     BusinessTerminalError,
     OutcomeUnknownError,
     SessionExpiredError,
+    parse_int,
 )
 from .sso import BuaaSessionManager, looks_like_login_page
 from .webvpn import (
-    EndpointDiagnostic,
-    diagnose_host_connection,
     from_webvpn_url,
     is_vpn_gateway_url,
     route_url,
@@ -156,15 +155,6 @@ class BoyaStatsData:
     raw: dict[str, Any]
 
 
-def _parse_int(value: Any) -> int | None:
-    if isinstance(value, bool) or value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except Exception:
-        return None
-
-
 def parse_sign_config(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
@@ -201,7 +191,7 @@ def _parse_campus_str(raw_campus: Any) -> str:
 def parse_course(raw: dict[str, Any]) -> BoyaCourseData:
     sign_config = parse_sign_config(raw.get("courseSignConfig"))
     points = sign_config.get("signPointList") if isinstance(sign_config, dict) else None
-    sign_type = _parse_int(raw.get("courseSignType"))
+    sign_type = parse_int(raw.get("courseSignType"))
     has_auto = (isinstance(points, list) and len(points) > 0) or sign_type == 2
     sign_method = "自主签到" if has_auto else "常规签到"
 
@@ -226,20 +216,20 @@ def parse_course(raw: dict[str, Any]) -> BoyaCourseData:
         sign_method=sign_method,
         has_autonomous_sign=has_auto,
         selected=bool(raw.get("selected", raw.get("isSelected", False))),
-        chosen_id=_parse_int(raw.get("chosenCourseId")),
+        chosen_id=parse_int(raw.get("chosenCourseId")),
         course_start=raw.get("courseStartDate"),
         course_end=raw.get("courseEndDate"),
         select_start=raw.get("courseSelectStartDate"),
         select_end=raw.get("courseSelectEndDate"),
         cancel_end=raw.get("courseCancelEndDate"),
-        current_count=_parse_int(raw.get("courseCurrentCount")),
-        max_count=_parse_int(raw.get("courseMaxCount")),
+        current_count=parse_int(raw.get("courseCurrentCount")),
+        max_count=parse_int(raw.get("courseMaxCount")),
         campus=_parse_campus_str(raw.get("courseCampusList")),
         sign_config=sign_config,
         sign_type=sign_type,
-        checkin=_parse_int(raw.get("checkin")),
-        pass_status=_parse_int(raw.get("pass")),
-        score=_parse_int(raw.get("score")),
+        checkin=parse_int(raw.get("checkin")),
+        pass_status=parse_int(raw.get("pass")),
+        score=parse_int(raw.get("score")),
         raw=raw,
     )
     course.resolved_campus = infer_course_campus(course)
@@ -260,7 +250,7 @@ def parse_chosen_course(raw: dict[str, Any]) -> BoyaCourseData:
 
 
 def parse_statistics(raw: dict[str, Any]) -> BoyaStatsData:
-    valid_count = _parse_int(raw.get("validCount")) or 0
+    valid_count = parse_int(raw.get("validCount")) or 0
     categories: list[BoyaCategoryStat] = []
     statistical = raw.get("statistical")
     if isinstance(statistical, dict):
@@ -272,8 +262,8 @@ def parse_statistics(raw: dict[str, Any]) -> BoyaStatsData:
                 if not isinstance(entry, dict):
                     continue
                 sub_name = normalize_sub_category(sub_key)
-                required = _parse_int(entry.get("assessmentCount")) or 0
-                passed = _parse_int(entry.get("completeAssessmentCount")) or 0
+                required = parse_int(entry.get("assessmentCount")) or 0
+                passed = parse_int(entry.get("completeAssessmentCount")) or 0
                 categories.append(
                     BoyaCategoryStat(
                         category=cat_name,
@@ -493,9 +483,6 @@ class BoyaClient:
     def _state_key(self) -> str:
         return f"bykc:{self.network_mode}"
 
-    def diagnose(self) -> EndpointDiagnostic:
-        return diagnose_host_connection(f"{BYKC_ORIGIN}/", self.network_mode)
-
     async def _ensure_token(self, force_refresh: bool = False) -> str:
         if not force_refresh:
             cached = self.session_mgr.load_domain_state(self._state_key)
@@ -641,8 +628,8 @@ class BoyaClient:
             page_data = resp.get("data") or {}
             content = page_data.get("content") or []
             courses.extend(parse_course(item) for item in content)
-            total_pages = _parse_int(page_data.get("totalPages"))
-            total_elements = _parse_int(page_data.get("totalElements"))
+            total_pages = parse_int(page_data.get("totalPages"))
+            total_elements = parse_int(page_data.get("totalElements"))
             if page_data.get("last") is True:
                 break
             if total_elements is not None and len(courses) >= total_elements:

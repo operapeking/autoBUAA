@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { formatTime, type BoyaCourse } from '@/api/client';
+import type { BoyaCourse } from '@/api/client';
+import { formatTime } from '@/lib/format';
 import BoyaCourseDetails from './BoyaCourseDetails.vue';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';

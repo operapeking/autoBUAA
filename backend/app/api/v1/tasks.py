@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.api.deps import require_admin
+from app.container import AppContainer
 from app.core.time import format_shanghai_iso
 from app.db.models import NotificationEvent, TaskExecution, TaskSchedule
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -75,7 +76,7 @@ def _serialize_execution(
 def list_schedules(
     module: str | None = None,
     status_filter: str | None = Query(default=None, alias="status"),
-    container: Any = Depends(require_admin),
+    container: AppContainer = Depends(require_admin),
 ) -> list[dict[str, Any]]:
     with container.session_factory() as session:
         q = session.query(TaskSchedule)
@@ -92,9 +93,8 @@ def list_executions(
     module: str | None = None,
     status_filter: str | None = Query(default=None, alias="status"),
     schedule_id: int | None = None,
-    date: str | None = None,
     limit: int = Query(default=50, ge=1, le=200),
-    container: Any = Depends(require_admin),
+    container: AppContainer = Depends(require_admin),
 ) -> list[dict[str, Any]]:
     with container.session_factory() as session:
         q = session.query(TaskExecution)
@@ -105,16 +105,13 @@ def list_executions(
         if schedule_id is not None:
             q = q.filter(TaskExecution.schedule_id == schedule_id)
         rows = q.order_by(TaskExecution.id.desc()).limit(limit).all()
-        items = [_serialize_execution(r) for r in rows]
-        if date:
-            items = [i for i in items if (i["scheduled_for"] or "").startswith(date)]
-        return items
+        return [_serialize_execution(r) for r in rows]
 
 
 @router.get("/executions/{execution_id}")
 def get_execution_detail(
     execution_id: int,
-    container: Any = Depends(require_admin),
+    container: AppContainer = Depends(require_admin),
 ) -> dict[str, Any]:
     with container.session_factory() as session:
         ex = session.get(TaskExecution, execution_id)
